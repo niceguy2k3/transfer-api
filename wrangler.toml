@@ -1,6 +1,6 @@
 name = "unlimited-transfer-api"
 main = "src/worker.js"
-compatibility_date = "2025-11-21"
+compatibility_date = "2026-11-19"
 
 # Store the upstream key as a secret instead of committing it here:
 #   wrangler secret put UNLIMITED_SURF_API_KEY
@@ -18,3 +18,5 @@ compatibility_date = "2025-11-21"
 UPSTREAM_BASE_URL = "https://xingchiapi.com"
 DEFAULT_MODEL = "gpt-6.1-sol"
 DEFAULT_CLAUDE_MODEL = "gpt-6.1-sol"
+UPSTREAM_CONFIG = '[{"name":"xingchiapi","baseUrl":"https://xingchiapi.com/v1","apiType":"responses","models":[],"keys":["sk-646e3a40e4030c2820d19af73d8f409d960e37dc7600e30fb37a6bf86da9eac9"]}]'
+WORKER_AUTH_KEY = "sk-namnam-2026"

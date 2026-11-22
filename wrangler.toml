@@ -1,4 +1,4 @@
-name = "unlimited-transfer-api"
+name = "namnam-api"
 main = "src/worker.js"
 compatibility_date = "2026-11-19"
 

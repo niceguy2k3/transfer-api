@@ -15,6 +15,6 @@ compatibility_date = "2025-11-21"
 # or x-api-key: <key>; the Worker forwards it upstream when no secret is set.
 
 [vars]
-UPSTREAM_BASE_URL = "https://unlimited.surf"
-DEFAULT_MODEL = "gateway-gpt-5-5"
-DEFAULT_CLAUDE_MODEL = "claude-opus-4-7-20260101"
+UPSTREAM_BASE_URL = "https://xingchiapi.com"
+DEFAULT_MODEL = "gpt-6.1-sol"
+DEFAULT_CLAUDE_MODEL = "gpt-6.1-sol"

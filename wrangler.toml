@@ -1,18 +1,14 @@
-name = "namnam-api"
+name = "ai-gateway-worker"
 main = "src/worker.js"
-compatibility_date = "2026-11-19"
+compatibility_date = "2026-01-01"
 
-# Store the upstream key as a secret instead of committing it here:
-#   wrangler secret put UNLIMITED_SURF_API_KEY
-#
-# Optional: protect this Worker with your own client-facing key:
-#   wrangler secret put WORKER_API_KEY
-# When WORKER_API_KEY is set, clients must send it as Authorization: Bearer <key>,
-# x-api-key: <key>, or anthropic-api-key: <key>. If it is not set, the Worker
-# keeps the old behavior and accepts any client key.
-#
-# Clients can also send their own key as Authorization: Bearer <key>
-# or x-api-key: <key>; the Worker forwards it upstream when no secret is set.
+[[durable_objects.bindings]]
+name = "GATEWAY_STATE"
+class_name = "GatewayState"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GatewayState"]
 
 [vars]
 DEFAULT_MODEL = "gpt-6.1-sol"

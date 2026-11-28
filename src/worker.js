@@ -1,6 +1,7 @@
 // ============================================================================
-// Cloudflare Worker AI Gateway v3.1.0
+// Cloudflare Worker AI Gateway v3.2.0
 // - Full Protocol Translation: OpenAI Responses <-> Chat Completions <-> Anthropic Messages
+// - Built-in Gemini Web Adapter (apiType: "gemini-web") running inside Durable Object
 // - Smart Key Health, Circuit Breaker & EWMA TTFB (Global via Durable Object)
 // - First-Chunk SSE Peek (Fake 200 OK error detection & seamless failover)
 // - Sticky Key Routing (Prompt Caching affinity)
@@ -18,7 +19,7 @@ const CORS_HEADERS = {
 };
 
 const CONFIG = {
-  VERSION: "3.1.0",
+  VERSION: "3.2.0",
   MAX_RETRY_KEYS_PER_UPSTREAM: 6,
   TRANSIENT_RETRIES: 2,
   RETRY_BASE_DELAY_MS: 400,
@@ -42,6 +43,7 @@ const CONFIG = {
   DEFAULT_ORIGINATOR: "codex_cli_rs"
 };
 
+const GEMINI_WEB_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const ALLOWED_CLIENT_UA_REGEX = /(codex|claude|cursor|kilo|cline|roo|opencode|trae|copilot|grok|qoder|hermes|zcode)/i;
 const REASONING_MODEL_REGEX = /(^|\/)(o1|o3|o4|gpt-5|codex|deepseek-reasoner|deepseek-r1|qwq)/i;
 const SANITIZE_400_REGEX = /(unsupported parameter|unknown parameter|not supported with this model|does not support|invalid_request_error|temperature|top_p|reasoning|max_tokens|max_completion_tokens|stream_options)/i;
@@ -389,6 +391,7 @@ async function executeAcrossUpstreams(params) {
 
   for (let uIdx = 0; uIdx < candidateUpstreams.length; uIdx++) {
     const upstream = candidateUpstreams[uIdx];
+    const apiType = resolveApiType(upstream);
     lastUpstream = upstream.name;
 
     let rawKeys = Array.isArray(upstream.keys) ? upstream.keys.filter(Boolean) : [];
@@ -396,7 +399,7 @@ async function executeAcrossUpstreams(params) {
       rawKeys = [clientKey];
     }
     if (rawKeys.length === 0) {
-      errorSummary = `Upstream '${upstream.name}' không có API key`;
+      errorSummary = `Upstream '${upstream.name}' không có API key/cookie`;
       continue;
     }
 
@@ -419,7 +422,7 @@ async function executeAcrossUpstreams(params) {
     });
 
     lastResponseMode = routePlan.responseMode;
-    const baseUrlClean = upstream.baseUrl.replace(/\/+$/, "");
+    const baseUrlClean = String(upstream.baseUrl || "").replace(/\/+$/, "");
     const targetUrl = `${baseUrlClean}/${routePlan.targetSubPath}${urlSearch}`;
     let bodyBuffer = routePlan.outgoingBodyText ? new TextEncoder().encode(routePlan.outgoingBodyText) : null;
     let didSanitizeRetry = false;
@@ -436,13 +439,35 @@ async function executeAcrossUpstreams(params) {
       const connectTimer = setTimeout(() => abortController.abort(new Error("Connect timeout")), CONFIG.CONNECT_TIMEOUT_MS);
 
       try {
-        const res = await fetch(targetUrl, {
-          method: httpMethod,
-          headers: upstreamHeaders,
-          body: bodyBuffer,
-          redirect: "follow",
-          signal: abortController.signal
-        });
+        let res;
+        if (apiType === "gemini-web") {
+          let payloadForGWeb = bodyJson || {};
+          if (routePlan.outgoingBodyText) {
+            try {
+              payloadForGWeb = JSON.parse(routePlan.outgoingBodyText);
+            } catch {
+              payloadForGWeb = bodyJson || {};
+            }
+          }
+          res = await callGeminiWebUpstream({
+            env,
+            upstream,
+            cookieStr: keyEntry.apiKey,
+            keyId: keyEntry.keyId,
+            model: effectiveModel,
+            chatPayload: payloadForGWeb,
+            signal: abortController.signal
+          });
+        } else {
+          res = await fetch(targetUrl, {
+            method: httpMethod,
+            headers: upstreamHeaders,
+            body: bodyBuffer,
+            redirect: "follow",
+            signal: abortController.signal
+          });
+        }
+
         clearTimeout(connectTimer);
         const ttfbMs = Date.now() - attemptStart;
 
@@ -495,7 +520,7 @@ async function executeAcrossUpstreams(params) {
               abortController.abort(new Error(peekResult.error));
               errorSummary = `SSE fake-200 error: ${peekResult.error}`;
               failoverCount++;
-              const isQuotaOrAuth = /(quota|insufficient|credit|balance|unauthorized|invalid_api_key|billing)/i.test(peekResult.error);
+              const isQuotaOrAuth = /(quota|insufficient|credit|balance|unauthorized|invalid_api_key|billing|cookie|snlm0e)/i.test(peekResult.error);
               const isRateLimit = /(rate_limit|429|too many|overloaded)/i.test(peekResult.error);
               reportKeyOutcome(env, ctx, {
                 keyId: keyEntry.keyId,
@@ -558,7 +583,7 @@ async function executeAcrossUpstreams(params) {
         const errBodySnippet = await res.clone().text().then((t) => t.slice(0, 350)).catch(() => "");
         errorSummary = `HTTP ${res.status} (${upstream.name}): ${errBodySnippet.slice(0, 120)}`;
 
-        if (res.status === 400 && !didSanitizeRetry && bodyJson && SANITIZE_400_REGEX.test(errBodySnippet)) {
+        if (res.status === 400 && !didSanitizeRetry && bodyJson && apiType !== "gemini-web" && SANITIZE_400_REGEX.test(errBodySnippet)) {
           didSanitizeRetry = true;
           const sanitizedPlan = buildUpstreamRequestPlan({
             upstream,
@@ -817,7 +842,8 @@ function buildUpstreamRequestPlan({
   const apiType = resolveApiType(upstream);
   const isResponsesOnly = apiType === "responses";
   const isAnthropicNative = apiType === "anthropic";
-  const useResponsesUpstream = isNativeResponsesRoute || isResponsesOnly;
+  const isGeminiWeb = apiType === "gemini-web";
+  const useResponsesUpstream = !isGeminiWeb && (isNativeResponsesRoute || isResponsesOnly);
   const shouldStripSampling = Boolean(strictSanitize || upstream.stripSamplingParams || isResponsesOnly || REASONING_MODEL_REGEX.test(effectiveModel));
 
   let targetSubPath = subPath;
@@ -828,7 +854,17 @@ function buildUpstreamRequestPlan({
   if (bodyJson && httpMethod === "POST") {
     const clonedBody = { ...bodyJson, model: effectiveModel };
 
-    if (isAnthropicRoute && isAnthropicNative) {
+    if (isGeminiWeb) {
+      // Adapter gemini-web trả về OpenAI Chat Completions (JSON hoặc SSE)
+      targetSubPath = "chat/completions";
+      if (isAnthropicRoute) {
+        responseMode = "chat_to_anthropic";
+        outgoingPayloadObj = convertAnthropicToOpenAIPayload(clonedBody, clientStreamRequested, false, false);
+      } else {
+        responseMode = "passthrough";
+        outgoingPayloadObj = clonedBody;
+      }
+    } else if (isAnthropicRoute && isAnthropicNative) {
       targetSubPath = "messages";
       responseMode = "passthrough";
       outgoingPayloadObj = clonedBody;
@@ -2375,12 +2411,16 @@ async function handleModelsRoute(request, env, ctx, url, upstreamConfig, modelAl
   }
 
   const fetchPromises = upstreamConfig.map(async (upstream) => {
+    if (resolveApiType(upstream) === "gemini-web") {
+      return fallbackStaticModels(upstream, upstreamConfig.length);
+    }
+
     const keys = Array.isArray(upstream.keys) ? upstream.keys.filter(Boolean) : [];
     if (keys.length === 0) return fallbackStaticModels(upstream, upstreamConfig.length);
 
     const ordered = selectOrderedKeys(upstream.name, keys, Math.floor(Math.random() * 1000));
     const chosen = ordered[0];
-    const targetModelsUrl = `${upstream.baseUrl.replace(/\/+$/, "")}/models`;
+    const targetModelsUrl = `${String(upstream.baseUrl || "").replace(/\/+$/, "")}/models`;
     const headers = buildCleanHeaders(request.headers, chosen.apiKey, false, upstream);
 
     try {
@@ -2628,6 +2668,7 @@ export class GatewayState {
       logs: []
     };
     this.rpmBuckets = new Map();
+    this.geminiSessions = new Map();
   }
 
   async ensureLoaded() {
@@ -2701,10 +2742,12 @@ export class GatewayState {
           k.consecutiveErrors = 0;
           k.lastError = "";
         }
+        this.geminiSessions.clear();
       } else if (this.data.keyHealth[keyId]) {
         this.data.keyHealth[keyId].cooldownUntil = 0;
         this.data.keyHealth[keyId].consecutiveErrors = 0;
         this.data.keyHealth[keyId].lastError = "";
+        this.geminiSessions.delete(keyId);
       }
       await this.flushIfNeeded(true);
       return Response.json({ ok: true });
@@ -2741,6 +2784,11 @@ export class GatewayState {
       this.data.logs = [];
       await this.flushIfNeeded(true);
       return Response.json({ ok: true });
+    }
+
+    if (path === "/gemini-web/generate" && request.method === "POST") {
+      const reqData = await request.json();
+      return handleGeminiWebInDO(this, reqData);
     }
 
     return new Response("Not Found", { status: 404 });
@@ -2892,6 +2940,28 @@ async function fetchAdminModelsDetail(request, env, forceRefresh = false) {
     const baseUrlClean = String(upstream.baseUrl || "").replace(/\/+$/, "");
     const targetModelsUrl = `${baseUrlClean}/models`;
 
+    if (resolveApiType(upstream) === "gemini-web") {
+      const staticList = fallbackStaticModels(upstream, totalUpstreams).map((m) => ({
+        rawId: String(m.id).replace(/\s*\(.*?\)/g, "").trim(),
+        displayId: m.id,
+        upstream: upstream.name,
+        ownedBy: upstream.name,
+        created: 0,
+        source: "static"
+      }));
+      return {
+        name: upstream.name,
+        baseUrl: baseUrlClean || "https://gemini.google.com",
+        apiType: "gemini-web",
+        status: staticList.length ? "live" : "error",
+        httpStatus: 200,
+        latencyMs: 0,
+        count: staticList.length,
+        error: staticList.length ? "" : "Hãy khai báo mảng models trong UPSTREAM_CONFIG",
+        models: staticList
+      };
+    }
+
     if (rawKeys.length === 0) {
       const staticList = fallbackStaticModels(upstream, totalUpstreams).map((m) => ({
         rawId: String(m.id).replace(/\s*\(.*?\)/g, "").trim(),
@@ -3027,7 +3097,7 @@ function renderAdminHTML() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI Gateway v3.1 — Admin Dashboard</title>
+<title>AI Gateway v3.2 — Admin Dashboard</title>
 <style>
   :root { --bg:#0b0f17; --card:#121826; --border:#1f2937; --text:#e5e7eb; --muted:#9ca3af; --accent:#3b82f6; --green:#10b981; --yellow:#f59e0b; --red:#ef4444; }
   * { box-sizing:border-box; }
@@ -3072,7 +3142,7 @@ function renderAdminHTML() {
 </head>
 <body>
 <div id="loginBox" class="card">
-  <h2 style="margin-top:0">AI Gateway v3.1 Admin</h2>
+  <h2 style="margin-top:0">AI Gateway v3.2 Admin</h2>
   <p style="color:var(--muted);font-size:13px">Nhập <b>ADMIN_KEY</b> (hoặc WORKER_AUTH_KEY) để đăng nhập.</p>
   <input id="adminKeyInput" type="password" placeholder="Admin Key..." style="width:100%;margin-bottom:12px" onkeydown="if(event.key==='Enter')doLogin()">
   <button class="primary" style="width:100%;padding:9px" onclick="doLogin()">Đăng nhập</button>
@@ -3081,7 +3151,7 @@ function renderAdminHTML() {
 
 <div id="app" class="hidden">
   <header>
-    <h1>⚡ AI Gateway <span id="verBadge" class="badge">v3.1</span> <span id="storageBadge" class="badge">...</span></h1>
+    <h1>⚡ AI Gateway <span id="verBadge" class="badge">v3.2</span> <span id="storageBadge" class="badge">...</span></h1>
     <div class="row-actions">
       <button onclick="loadState()">↻ Làm mới</button>
       <button onclick="resetKey('ALL')">Mở khóa tất cả Key</button>
@@ -3101,7 +3171,7 @@ function renderAdminHTML() {
         <div class="card"><div class="stat-label">Tổng Requests</div><div class="stat-val" id="stReq">0</div><div class="stat-sub" id="stRate">Success: 100%</div></div>
         <div class="card"><div class="stat-label">Failovers đã cứu</div><div class="stat-val" id="stFailover">0</div><div class="stat-sub" id="stErr">Errors: 0</div></div>
         <div class="card"><div class="stat-label">Input / Output Tokens</div><div class="stat-val" id="stTok">0</div><div class="stat-sub" id="stCache">Cached: 0</div></div>
-        <div class="card"><div class="stat-label">API Keys</div><div class="stat-val" id="stKeys">0/0</div><div class="stat-sub" id="stKv">KV Cache: Off</div></div>
+        <div class="card"><div class="stat-label">API Keys / Cookies</div><div class="stat-val" id="stKeys">0/0</div><div class="stat-sub" id="stKv">KV Cache: Off</div></div>
       </div>
 
       <div class="card">
@@ -3111,7 +3181,7 @@ function renderAdminHTML() {
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Upstream</th><th>Key</th><th>Trạng thái</th><th>EWMA TTFB</th><th>OK / Lỗi</th><th>Lỗi gần nhất</th><th>Thao tác</th></tr></thead>
+            <thead><tr><th>Upstream</th><th>Key / Cookie</th><th>Trạng thái</th><th>EWMA TTFB</th><th>OK / Lỗi</th><th>Lỗi gần nhất</th><th>Thao tác</th></tr></thead>
             <tbody id="keysTbody"></tbody>
           </table>
         </div>
@@ -3285,7 +3355,7 @@ async function loadAdminModels(forceRefresh) {
           : '<span class="badge err">ERROR</span>';
       return '<div class="up-card">'
         + '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px"><b>' + esc(u.name) + '</b>' + badge + '</div>'
-        + '<div class="mono" style="color:var(--muted);word-break:break-all">' + esc(u.baseUrl) + '/models</div>'
+        + '<div class="mono" style="color:var(--muted);word-break:break-all">' + esc(u.baseUrl) + (u.apiType === "gemini-web" ? '' : '/models') + '</div>'
         + '<div style="margin-top:8px;font-size:12px">Models: <b>' + u.count + '</b> | API: <b>' + esc(u.apiType) + '</b> | Latency: <b>' + (u.latencyMs || 0) + 'ms</b></div>'
         + (u.error ? '<div style="margin-top:6px;color:#fca5a5;font-size:12px">' + esc(u.error) + '</div>' : '')
         + '</div>';
@@ -3434,6 +3504,342 @@ async function clearStats() {
 </script>
 </body>
 </html>`;
+}
+
+// ============================================================================
+// GEMINI WEB ADAPTER (RUNS INSIDE DURABLE OBJECT FOR COLO STICKINESS & COOKIE CACHE)
+// ============================================================================
+async function callGeminiWebUpstream({ env, upstream, cookieStr, keyId, model, chatPayload, signal }) {
+  const payload = {
+    keyId,
+    cookieStr,
+    model,
+    stream: Boolean(chatPayload?.stream),
+    prompt: flattenChatMessagesToPrompt(chatPayload),
+    modelHeader: upstream?.modelHeaders?.[model] || ""
+  };
+
+  const stub = getDOStub(env);
+  if (stub) {
+    return stub.fetch("https://do.internal/gemini-web/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal
+    });
+  }
+
+  const fakeDO = { geminiSessions: new Map() };
+  return handleGeminiWebInDO(fakeDO, payload);
+}
+
+function flattenChatMessagesToPrompt(chat) {
+  const parts = [];
+  if (chat?.instructions) {
+    parts.push(`[System]\n${String(chat.instructions)}`);
+  }
+
+  // Hỗ trợ cả Chat Completions (messages) lẫn Responses API (input)
+  const msgs = Array.isArray(chat?.messages)
+    ? chat.messages
+    : Array.isArray(chat?.input)
+      ? chat.input
+      : typeof chat?.input === "string"
+        ? [{ role: "user", content: chat.input }]
+        : [];
+
+  for (const m of msgs) {
+    const text = extractPlainText(m?.content ?? m?.output);
+    if (!text) continue;
+    const role = m.role === "system" || m.role === "developer"
+      ? "System"
+      : m.role === "assistant"
+        ? "Assistant"
+        : "User";
+    parts.push(`[${role}]\n${text}`);
+  }
+
+  if (parts.length === 1 && msgs.length === 1 && (msgs[0].role === "user" || !msgs[0].role)) {
+    return extractPlainText(msgs[0].content);
+  }
+  return parts.join("\n\n") || "Hello";
+}
+
+function mergeCookieHeader(baseCookie, setCookieList) {
+  const map = new Map();
+  for (const pair of String(baseCookie || "").split(";")) {
+    const idx = pair.indexOf("=");
+    if (idx > 0) map.set(pair.slice(0, idx).trim(), pair.slice(idx + 1).trim());
+  }
+  for (const sc of setCookieList || []) {
+    const firstPart = String(sc).split(";")[0];
+    const idx = firstPart.indexOf("=");
+    if (idx > 0) {
+      const k = firstPart.slice(0, idx).trim();
+      const v = firstPart.slice(idx + 1).trim();
+      if (v && v !== '""') map.set(k, v);
+    }
+  }
+  return Array.from(map.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+async function getOrRefreshGeminiSession(doInstance, keyId, rawCookie, forceRefresh = false) {
+  const cached = doInstance.geminiSessions.get(keyId);
+  if (!forceRefresh && cached && Date.now() < cached.expiresAt) {
+    return cached;
+  }
+
+  const activeCookie = cached?.cookie || rawCookie;
+  const res = await fetch("https://gemini.google.com/app", {
+    method: "GET",
+    headers: {
+      "User-Agent": GEMINI_WEB_UA,
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Cookie": activeCookie
+    },
+    redirect: "follow"
+  });
+
+  const html = await res.text();
+  const snlm0e = html.match(/"SNlM0e":"([^"]+)"/)?.[1] || "";
+  const bl = html.match(/"cfb2h":"([^"]+)"/)?.[1] || "";
+  const fsid = html.match(/"FdrFJe":"([^"]+)"/)?.[1] || "";
+
+  if (!snlm0e) {
+    return { error: `Không lấy được SNlM0e (HTTP ${res.status}) — Cookie hết hạn hoặc Google chặn IP Cloudflare` };
+  }
+
+  const setCookies = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
+  const mergedCookie = mergeCookieHeader(activeCookie, setCookies);
+
+  const session = {
+    snlm0e,
+    bl,
+    fsid,
+    cookie: mergedCookie,
+    reqId: Math.floor(100000 + Math.random() * 800000),
+    expiresAt: Date.now() + 15 * 60 * 1000
+  };
+  doInstance.geminiSessions.set(keyId, session);
+  return session;
+}
+
+async function handleGeminiWebInDO(doInstance, { keyId, cookieStr, model, stream, prompt, modelHeader }) {
+  let session = await getOrRefreshGeminiSession(doInstance, keyId, cookieStr, false);
+  if (session.error) {
+    return Response.json({ error: { message: session.error, type: "gemini_web_auth_error" } }, { status: 401 });
+  }
+
+  const sendGenerate = async (sess) => {
+    sess.reqId += 100000;
+    const qs = new URLSearchParams({
+      hl: "en",
+      _reqid: String(sess.reqId),
+      rt: "c"
+    });
+    if (sess.bl) qs.set("bl", sess.bl);
+    if (sess.fsid) qs.set("f.sid", sess.fsid);
+
+    const innerReq = JSON.stringify([[prompt], null, ["", "", ""]]);
+    const form = new URLSearchParams({
+      at: sess.snlm0e,
+      "f.req": JSON.stringify([null, innerReq])
+    });
+
+    const headers = {
+      "User-Agent": GEMINI_WEB_UA,
+      "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+      "Origin": "https://gemini.google.com",
+      "Referer": "https://gemini.google.com/",
+      "X-Same-Domain": "1",
+      "Cookie": sess.cookie
+    };
+    if (modelHeader) {
+      headers["x-goog-ext-525001261-jspb"] = modelHeader;
+    }
+
+    return fetch(`https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?${qs}`, {
+      method: "POST",
+      headers,
+      body: form.toString()
+    });
+  };
+
+  let upRes = await sendGenerate(session);
+
+  // Nếu token SNlM0e vừa xoay vòng -> refresh 1 lần và gọi lại
+  if (upRes.status === 400 || upRes.status === 401 || upRes.status === 403) {
+    session = await getOrRefreshGeminiSession(doInstance, keyId, cookieStr, true);
+    if (session.error) {
+      return Response.json({ error: { message: session.error, type: "gemini_web_auth_error" } }, { status: 401 });
+    }
+    upRes = await sendGenerate(session);
+  }
+
+  const newSetCookies = typeof upRes.headers.getSetCookie === "function" ? upRes.headers.getSetCookie() : [];
+  if (newSetCookies.length > 0) {
+    session.cookie = mergeCookieHeader(session.cookie, newSetCookies);
+  }
+
+  if (!upRes.ok || !upRes.body) {
+    const errText = await upRes.text().then((t) => t.slice(0, 200)).catch(() => "");
+    return Response.json({
+      error: { message: `Gemini Web HTTP ${upRes.status}: ${errText}`, type: "gemini_web_upstream_error" }
+    }, { status: upRes.status >= 400 ? upRes.status : 502 });
+  }
+
+  if (!stream) {
+    const rawText = await upRes.text();
+    const { text, reasoning, error } = parseGeminiWebFullBody(rawText);
+    if (error) {
+      return Response.json({ error: { message: error, type: "gemini_web_parse_error" } }, { status: 502 });
+    }
+    const msg = { role: "assistant", content: text };
+    if (reasoning) msg.reasoning_content = reasoning;
+    return Response.json({
+      id: `chatcmpl_gweb_${Date.now()}`,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{ index: 0, message: msg, finish_reason: "stop" }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+    });
+  }
+
+  // Streaming -> dịch wrb.fr thành OpenAI Chat Completions SSE
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const reader = upRes.body.getReader();
+  const chatId = `chatcmpl_gweb_${Date.now()}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  const sseStream = new ReadableStream({
+    async start(controller) {
+      let buffer = "";
+      let lastText = "";
+      let lastReasoning = "";
+      let emittedAny = false;
+
+      const sendDelta = (delta, finishReason = null) => {
+        const chunk = {
+          id: chatId,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{ index: 0, delta, finish_reason: finishReason }]
+        };
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+      };
+
+      const processLine = (line) => {
+        const extracted = extractTextFromGeminiLine(line);
+        if (!extracted) return;
+
+        if (extracted.reasoning && extracted.reasoning.length > lastReasoning.length) {
+          const rDelta = extracted.reasoning.startsWith(lastReasoning)
+            ? extracted.reasoning.slice(lastReasoning.length)
+            : extracted.reasoning;
+          lastReasoning = extracted.reasoning;
+          if (rDelta) {
+            emittedAny = true;
+            sendDelta({ reasoning_content: rDelta });
+          }
+        }
+
+        if (extracted.text && extracted.text.length > lastText.length) {
+          const tDelta = extracted.text.startsWith(lastText)
+            ? extracted.text.slice(lastText.length)
+            : extracted.text;
+          lastText = extracted.text;
+          if (tDelta) {
+            emittedAny = true;
+            sendDelta({ content: tDelta });
+          }
+        }
+      };
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+          for (const line of lines) processLine(line);
+        }
+        if (buffer.trim()) processLine(buffer);
+
+        if (!emittedAny) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: "Gemini Web không trả về nội dung (cookie hết hạn hoặc bị chặn)" } })}\n\n`));
+        } else {
+          sendDelta({}, "stop");
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        }
+      } catch (err) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: err?.message || "Gemini Web stream error" } })}\n\n`));
+      } finally {
+        controller.close();
+      }
+    },
+    async cancel() {
+      await reader.cancel().catch(() => {});
+    }
+  });
+
+  return new Response(sseStream, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform"
+    }
+  });
+}
+
+function extractTextFromGeminiLine(rawLine) {
+  const line = String(rawLine || "").trim();
+  if (!line.startsWith("[")) return null;
+  try {
+    const outer = JSON.parse(line);
+    if (!Array.isArray(outer)) return null;
+    for (const item of outer) {
+      if (Array.isArray(item) && item[0] === "wrb.fr" && typeof item[2] === "string") {
+        const inner = JSON.parse(item[2]);
+        const candidate = inner?.[4]?.[0];
+        if (!candidate) continue;
+        const text = typeof candidate?.[1]?.[0] === "string" ? candidate[1][0] : "";
+        const reasoning = typeof candidate?.[37]?.[0]?.[0] === "string" ? candidate[37][0][0] : "";
+        if (text || reasoning) return { text, reasoning };
+      }
+    }
+  } catch {
+    // ignore non-JSON framing lines
+  }
+  return null;
+}
+
+function parseGeminiWebFullBody(rawText) {
+  let finalText = "";
+  let finalReasoning = "";
+  const lines = String(rawText || "").split("\n");
+  for (const line of lines) {
+    const extracted = extractTextFromGeminiLine(line);
+    if (!extracted) continue;
+    if (extracted.text && extracted.text.length >= finalText.length) {
+      finalText = extracted.text;
+    }
+    if (extracted.reasoning && extracted.reasoning.length >= finalReasoning.length) {
+      finalReasoning = extracted.reasoning;
+    }
+  }
+  if (!finalText && !finalReasoning) {
+    return {
+      text: "",
+      reasoning: "",
+      error: "Không trích xuất được nội dung từ Gemini Web (cookie hết hạn hoặc bị chặn)"
+    };
+  }
+  return { text: finalText, reasoning: finalReasoning, error: "" };
 }
 
 // ============================================================================

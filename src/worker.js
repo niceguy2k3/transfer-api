@@ -1,7 +1,9 @@
 // ============================================================================
-// Cloudflare Worker AI Gateway v3.2.0
+// Cloudflare Worker AI Gateway v3.3.0
 // - Full Protocol Translation: OpenAI Responses <-> Chat Completions <-> Anthropic Messages
 // - Built-in Gemini Web Adapter (apiType: "gemini-web") running inside Durable Object
+//   + Tool Calling Emulation (XML <tool_call> <-> OpenAI/Anthropic tool_calls & tool_results)
+//   + Thinking/Reasoning extraction & cumulative-delta deduplication
 // - Smart Key Health, Circuit Breaker & EWMA TTFB (Global via Durable Object)
 // - First-Chunk SSE Peek (Fake 200 OK error detection & seamless failover)
 // - Sticky Key Routing (Prompt Caching affinity)
@@ -19,13 +21,13 @@ const CORS_HEADERS = {
 };
 
 const CONFIG = {
-  VERSION: "3.2.0",
+  VERSION: "3.3.0",
   MAX_RETRY_KEYS_PER_UPSTREAM: 6,
   TRANSIENT_RETRIES: 2,
   RETRY_BASE_DELAY_MS: 400,
   CONNECT_TIMEOUT_MS: 25000,
-  FIRST_CHUNK_TIMEOUT_MS: 30000,
-  STREAM_IDLE_TIMEOUT_MS: 45000,
+  FIRST_CHUNK_TIMEOUT_MS: 45000, // Tăng lên 45s cho các model Thinking High suy nghĩ sâu
+  STREAM_IDLE_TIMEOUT_MS: 60000, // Tăng lên 60s tránh cắt nhầm giữa giai đoạn suy luận
   HEARTBEAT_INTERVAL_MS: 15000,
   MODELS_TIMEOUT_MS: 6000,
   MODELS_CACHE_TTL_MS: 60000,
@@ -855,7 +857,7 @@ function buildUpstreamRequestPlan({
     const clonedBody = { ...bodyJson, model: effectiveModel };
 
     if (isGeminiWeb) {
-      // Adapter gemini-web trả về OpenAI Chat Completions (JSON hoặc SSE)
+      // Adapter gemini-web trả về OpenAI Chat Completions (JSON hoặc SSE) kèm Tool Calling Emulation
       targetSubPath = "chat/completions";
       if (isAnthropicRoute) {
         responseMode = "chat_to_anthropic";
@@ -3097,7 +3099,7 @@ function renderAdminHTML() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI Gateway v3.2 — Admin Dashboard</title>
+<title>AI Gateway v3.3 — Admin Dashboard</title>
 <style>
   :root { --bg:#0b0f17; --card:#121826; --border:#1f2937; --text:#e5e7eb; --muted:#9ca3af; --accent:#3b82f6; --green:#10b981; --yellow:#f59e0b; --red:#ef4444; }
   * { box-sizing:border-box; }
@@ -3142,7 +3144,7 @@ function renderAdminHTML() {
 </head>
 <body>
 <div id="loginBox" class="card">
-  <h2 style="margin-top:0">AI Gateway v3.2 Admin</h2>
+  <h2 style="margin-top:0">AI Gateway v3.3 Admin</h2>
   <p style="color:var(--muted);font-size:13px">Nhập <b>ADMIN_KEY</b> (hoặc WORKER_AUTH_KEY) để đăng nhập.</p>
   <input id="adminKeyInput" type="password" placeholder="Admin Key..." style="width:100%;margin-bottom:12px" onkeydown="if(event.key==='Enter')doLogin()">
   <button class="primary" style="width:100%;padding:9px" onclick="doLogin()">Đăng nhập</button>
@@ -3151,7 +3153,7 @@ function renderAdminHTML() {
 
 <div id="app" class="hidden">
   <header>
-    <h1>⚡ AI Gateway <span id="verBadge" class="badge">v3.2</span> <span id="storageBadge" class="badge">...</span></h1>
+    <h1>⚡ AI Gateway <span id="verBadge" class="badge">v3.3</span> <span id="storageBadge" class="badge">...</span></h1>
     <div class="row-actions">
       <button onclick="loadState()">↻ Làm mới</button>
       <button onclick="resetKey('ALL')">Mở khóa tất cả Key</button>
@@ -3191,7 +3193,7 @@ function renderAdminHTML() {
         <div class="section-head">
           <h2>🎟️ Virtual Keys & Giới hạn RPM</h2>
           <div class="row-actions">
-            <input id="vkName" placeholder="Tên máy / App (vd: Claude Code)">
+            <input id="vkName" placeholder="Tên máy / App (vd: OpenCode)">
             <input id="vkRpm" type="number" min="0" value="30" style="width:90px" title="0 = không giới hạn">
             <button class="primary" onclick="createVK()">+ Tạo Key</button>
           </div>
@@ -3507,15 +3509,23 @@ async function clearStats() {
 }
 
 // ============================================================================
-// GEMINI WEB ADAPTER (RUNS INSIDE DURABLE OBJECT FOR COLO STICKINESS & COOKIE CACHE)
+// GEMINI WEB ADAPTER + TOOL CALLING EMULATION (RUNS INSIDE DURABLE OBJECT)
 // ============================================================================
+const TOOL_OPEN_TAG = "<tool_call>";
+const TOOL_CLOSE_TAG = "</tool_call>";
+
 async function callGeminiWebUpstream({ env, upstream, cookieStr, keyId, model, chatPayload, signal }) {
+  const tools = (!upstream?.disableToolEmulation && Array.isArray(chatPayload?.tools) && chatPayload.tools.length > 0 && chatPayload?.tool_choice !== "none")
+    ? chatPayload.tools
+    : [];
+
   const payload = {
     keyId,
     cookieStr,
     model,
     stream: Boolean(chatPayload?.stream),
-    prompt: flattenChatMessagesToPrompt(chatPayload),
+    hasTools: tools.length > 0,
+    prompt: flattenChatMessagesToPrompt(chatPayload, tools),
     modelHeader: upstream?.modelHeaders?.[model] || ""
   };
 
@@ -3533,13 +3543,51 @@ async function callGeminiWebUpstream({ env, upstream, cookieStr, keyId, model, c
   return handleGeminiWebInDO(fakeDO, payload);
 }
 
-function flattenChatMessagesToPrompt(chat) {
-  const parts = [];
-  if (chat?.instructions) {
-    parts.push(`[System]\n${String(chat.instructions)}`);
+function buildToolSystemInstruction(tools, toolChoice) {
+  const normalized = tools.map((t) => {
+    const fn = t?.type === "function" && t.function ? t.function : t;
+    return {
+      name: fn?.name || "",
+      description: fn?.description || "",
+      parameters: fn?.parameters || fn?.input_schema || { type: "object", properties: {} }
+    };
+  }).filter((t) => t.name);
+
+  if (normalized.length === 0) return "";
+
+  let choiceRule = "";
+  if (toolChoice === "required") {
+    choiceRule = "\n- You MUST invoke at least one tool in this turn.";
+  } else if (typeof toolChoice === "object" && (toolChoice?.function?.name || toolChoice?.name)) {
+    const forcedName = toolChoice.function?.name || toolChoice.name;
+    choiceRule = `\n- You MUST invoke the tool named "${forcedName}" in this turn.`;
   }
 
-  // Hỗ trợ cả Chat Completions (messages) lẫn Responses API (input)
+  return [
+    "### TOOL CALLING PROTOCOL (STRICT)",
+    "You have access to the following tools:",
+    JSON.stringify(normalized),
+    "",
+    "Rules for invoking tools:",
+    `- To call a tool, output a ${TOOL_OPEN_TAG} block containing ONLY valid JSON with "name" and "arguments" keys:`,
+    `  ${TOOL_OPEN_TAG}{"name":"tool_name","arguments":{"param":"value"}}${TOOL_CLOSE_TAG}`,
+    "- Do NOT wrap <tool_call> blocks in markdown code fences (no ```json or ```xml).",
+    "- You may emit multiple <tool_call> blocks in one response for parallel tool calls.",
+    "- After emitting <tool_call> block(s), STOP and wait for the <tool_result> response. Do not fabricate tool outputs.",
+    `- If no tool is needed, reply normally without using ${TOOL_OPEN_TAG}.${choiceRule}`
+  ].join("\n");
+}
+
+function flattenChatMessagesToPrompt(chat, tools = []) {
+  const sysParts = [];
+  if (chat?.instructions) {
+    sysParts.push(String(chat.instructions));
+  }
+  if (tools.length > 0) {
+    const toolGuide = buildToolSystemInstruction(tools, chat?.tool_choice);
+    if (toolGuide) sysParts.push(toolGuide);
+  }
+
   const msgs = Array.isArray(chat?.messages)
     ? chat.messages
     : Array.isArray(chat?.input)
@@ -3548,21 +3596,149 @@ function flattenChatMessagesToPrompt(chat) {
         ? [{ role: "user", content: chat.input }]
         : [];
 
+  const convParts = [];
   for (const m of msgs) {
-    const text = extractPlainText(m?.content ?? m?.output);
-    if (!text) continue;
-    const role = m.role === "system" || m.role === "developer"
-      ? "System"
-      : m.role === "assistant"
-        ? "Assistant"
-        : "User";
-    parts.push(`[${role}]\n${text}`);
+    if (!m) continue;
+
+    if (m.role === "system" || m.role === "developer") {
+      const text = extractPlainText(m.content);
+      if (text) sysParts.push(text);
+      continue;
+    }
+
+    // Tool result (OpenAI role: "tool" hoặc Responses function_call_output)
+    if (m.role === "tool" || m.type === "function_call_output") {
+      const callId = m.tool_call_id || m.call_id || "";
+      const toolName = m.name || "";
+      const outText = typeof (m.content ?? m.output) === "string"
+        ? (m.content ?? m.output)
+        : JSON.stringify(m.content ?? m.output ?? "");
+      const attrs = [callId ? `id="${callId}"` : "", toolName ? `name="${toolName}"` : ""].filter(Boolean).join(" ");
+      convParts.push(`<tool_result${attrs ? " " + attrs : ""}>\n${outText}\n</tool_result>`);
+      continue;
+    }
+
+    // Responses function_call item
+    if (m.type === "function_call") {
+      let argsObj = {};
+      try {
+        argsObj = typeof m.arguments === "string" ? JSON.parse(m.arguments || "{}") : (m.arguments || {});
+      } catch {
+        argsObj = m.arguments || {};
+      }
+      convParts.push(`[Assistant]\n${TOOL_OPEN_TAG}${JSON.stringify({ name: m.name || "", arguments: argsObj })}${TOOL_CLOSE_TAG}`);
+      continue;
+    }
+
+    if (m.role === "assistant") {
+      const chunks = [];
+      const text = extractPlainText(m.content);
+      if (text) chunks.push(text);
+      if (Array.isArray(m.tool_calls)) {
+        for (const tc of m.tool_calls) {
+          let parsedArgs = {};
+          const rawArgs = tc?.function?.arguments ?? tc?.arguments ?? "{}";
+          try {
+            parsedArgs = typeof rawArgs === "string" ? JSON.parse(rawArgs || "{}") : (rawArgs || {});
+          } catch {
+            parsedArgs = rawArgs;
+          }
+          chunks.push(`${TOOL_OPEN_TAG}${JSON.stringify({ name: tc?.function?.name || tc?.name || "", arguments: parsedArgs })}${TOOL_CLOSE_TAG}`);
+        }
+      }
+      if (chunks.length > 0) convParts.push(`[Assistant]\n${chunks.join("\n")}`);
+      continue;
+    }
+
+    const userText = extractPlainText(m.content);
+    if (userText) {
+      convParts.push(`[User]\n${userText}`);
+    }
   }
 
-  if (parts.length === 1 && msgs.length === 1 && (msgs[0].role === "user" || !msgs[0].role)) {
+  // Trường hợp đơn giản 1 câu user không system/tools -> gửi thẳng text gọn nhất
+  if (sysParts.length === 0 && convParts.length === 1 && msgs.length === 1 && (msgs[0].role === "user" || !msgs[0].role)) {
     return extractPlainText(msgs[0].content);
   }
-  return parts.join("\n\n") || "Hello";
+
+  const finalBlocks = [];
+  if (sysParts.length > 0) {
+    finalBlocks.push(`[System]\n${sysParts.join("\n\n")}`);
+  }
+  finalBlocks.push(...convParts);
+  return finalBlocks.join("\n\n") || "Hello";
+}
+
+function parseSingleToolCallPayload(rawInsideTag) {
+  let cleaned = String(rawInsideTag || "").trim();
+  // Gỡ markdown code fence nếu model lỡ bọc bên trong thẻ
+  cleaned = cleaned.replace(/^```(?:json|xml)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  if (!cleaned) return null;
+
+  try {
+    const obj = JSON.parse(cleaned);
+    const name = obj?.name || obj?.function?.name || "";
+    if (!name || typeof name !== "string") return null;
+    const rawArgs = obj.arguments ?? obj.args ?? obj.parameters ?? obj?.function?.arguments ?? {};
+    const argsStr = typeof rawArgs === "string" ? rawArgs : JSON.stringify(rawArgs ?? {});
+    return { name: name.trim(), arguments: argsStr };
+  } catch {
+    return null;
+  }
+}
+
+function extractToolCallsFromFullText(fullText) {
+  const text = String(fullText || "");
+  const toolCalls = [];
+  const regex = /<tool_call>([\s\S]*?)<\/tool_call>/gi;
+  let lastIdx = 0;
+  const visibleParts = [];
+  let match;
+
+  while ((match = regex.exec(text)) !== null) {
+    visibleParts.push(text.slice(lastIdx, match.index));
+    const parsed = parseSingleToolCallPayload(match[1]);
+    if (parsed) {
+      toolCalls.push({
+        id: `call_gweb_${Date.now()}_${toolCalls.length}`,
+        type: "function",
+        function: { name: parsed.name, arguments: parsed.arguments }
+      });
+    } else {
+      visibleParts.push(match[0]);
+    }
+    lastIdx = regex.lastIndex;
+  }
+  visibleParts.push(text.slice(lastIdx));
+
+  // Xử lý trường hợp model quên thẻ đóng </tool_call> ở cuối
+  let remaining = visibleParts.join("");
+  const openPos = remaining.indexOf(TOOL_OPEN_TAG);
+  if (openPos >= 0) {
+    const tail = remaining.slice(openPos + TOOL_OPEN_TAG.length);
+    const parsedTail = parseSingleToolCallPayload(tail);
+    if (parsedTail) {
+      toolCalls.push({
+        id: `call_gweb_${Date.now()}_${toolCalls.length}`,
+        type: "function",
+        function: { name: parsedTail.name, arguments: parsedTail.arguments }
+      });
+      remaining = remaining.slice(0, openPos);
+    }
+  }
+
+  return {
+    content: remaining.trim(),
+    toolCalls
+  };
+}
+
+function getPartialTagSuffixLength(str, tag) {
+  const maxLen = Math.min(str.length, tag.length - 1);
+  for (let len = maxLen; len >= 1; len--) {
+    if (str.endsWith(tag.slice(0, len))) return len;
+  }
+  return 0;
 }
 
 function mergeCookieHeader(baseCookie, setCookieList) {
@@ -3625,7 +3801,7 @@ async function getOrRefreshGeminiSession(doInstance, keyId, rawCookie, forceRefr
   return session;
 }
 
-async function handleGeminiWebInDO(doInstance, { keyId, cookieStr, model, stream, prompt, modelHeader }) {
+async function handleGeminiWebInDO(doInstance, { keyId, cookieStr, model, stream, hasTools, prompt, modelHeader }) {
   let session = await getOrRefreshGeminiSession(doInstance, keyId, cookieStr, false);
   if (session.error) {
     return Response.json({ error: { message: session.error, type: "gemini_web_auth_error" } }, { status: 401 });
@@ -3668,7 +3844,6 @@ async function handleGeminiWebInDO(doInstance, { keyId, cookieStr, model, stream
 
   let upRes = await sendGenerate(session);
 
-  // Nếu token SNlM0e vừa xoay vòng -> refresh 1 lần và gọi lại
   if (upRes.status === 400 || upRes.status === 401 || upRes.status === 403) {
     session = await getOrRefreshGeminiSession(doInstance, keyId, cookieStr, true);
     if (session.error) {
@@ -3689,25 +3864,37 @@ async function handleGeminiWebInDO(doInstance, { keyId, cookieStr, model, stream
     }, { status: upRes.status >= 400 ? upRes.status : 502 });
   }
 
+  // Non-streaming
   if (!stream) {
     const rawText = await upRes.text();
     const { text, reasoning, error } = parseGeminiWebFullBody(rawText);
     if (error) {
       return Response.json({ error: { message: error, type: "gemini_web_parse_error" } }, { status: 502 });
     }
-    const msg = { role: "assistant", content: text };
+
+    let finalContent = text;
+    let toolCalls = [];
+    if (hasTools) {
+      const parsed = extractToolCallsFromFullText(text);
+      finalContent = parsed.content;
+      toolCalls = parsed.toolCalls;
+    }
+
+    const msg = { role: "assistant", content: finalContent || (toolCalls.length > 0 ? null : "") };
     if (reasoning) msg.reasoning_content = reasoning;
+    if (toolCalls.length > 0) msg.tool_calls = toolCalls;
+
     return Response.json({
       id: `chatcmpl_gweb_${Date.now()}`,
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
       model,
-      choices: [{ index: 0, message: msg, finish_reason: "stop" }],
+      choices: [{ index: 0, message: msg, finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop" }],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
     });
   }
 
-  // Streaming -> dịch wrb.fr thành OpenAI Chat Completions SSE
+  // Streaming -> dịch wrb.fr thành OpenAI Chat Completions SSE (có bộ đệm tách <tool_call>)
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   const reader = upRes.body.getReader();
@@ -3721,6 +3908,11 @@ async function handleGeminiWebInDO(doInstance, { keyId, cookieStr, model, stream
       let lastReasoning = "";
       let emittedAny = false;
 
+      // Trạng thái bộ lọc Tool Calling Emulation khi streaming
+      let pendingText = "";
+      let inToolCall = false;
+      let toolCallIndex = 0;
+
       const sendDelta = (delta, finishReason = null) => {
         const chunk = {
           id: chatId,
@@ -3730,6 +3922,100 @@ async function handleGeminiWebInDO(doInstance, { keyId, cookieStr, model, stream
           choices: [{ index: 0, delta, finish_reason: finishReason }]
         };
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+      };
+
+      const emitToolCall = (parsedTool) => {
+        const idx = toolCallIndex++;
+        emittedAny = true;
+        sendDelta({
+          tool_calls: [{
+            index: idx,
+            id: `call_gweb_${Date.now()}_${idx}`,
+            type: "function",
+            function: { name: parsedTool.name, arguments: parsedTool.arguments }
+          }]
+        });
+      };
+
+      const drainToolAwareBuffer = (isEOF = false) => {
+        if (!hasTools) {
+          if (pendingText) {
+            emittedAny = true;
+            sendDelta({ content: pendingText });
+            pendingText = "";
+          }
+          return;
+        }
+
+        while (pendingText.length > 0) {
+          if (!inToolCall) {
+            const openIdx = pendingText.indexOf(TOOL_OPEN_TAG);
+            if (openIdx !== -1) {
+              const before = pendingText.slice(0, openIdx);
+              if (before) {
+                emittedAny = true;
+                sendDelta({ content: before });
+              }
+              pendingText = pendingText.slice(openIdx + TOOL_OPEN_TAG.length);
+              inToolCall = true;
+              continue;
+            }
+
+            if (isEOF) {
+              // Không xả khoảng trắng thừa nếu đã gọi tool
+              if (pendingText.trim() || toolCallIndex === 0) {
+                emittedAny = true;
+                sendDelta({ content: pendingText });
+              }
+              pendingText = "";
+              break;
+            }
+
+            // Giữ lại phần đuôi có thể đang dở thẻ "<tool_call>"
+            const holdLen = getPartialTagSuffixLength(pendingText, TOOL_OPEN_TAG);
+            const safeLen = pendingText.length - holdLen;
+            if (safeLen > 0) {
+              const safeChunk = pendingText.slice(0, safeLen);
+              emittedAny = true;
+              sendDelta({ content: safeChunk });
+              pendingText = pendingText.slice(safeLen);
+            }
+            break;
+          } else {
+            const closeIdx = pendingText.indexOf(TOOL_CLOSE_TAG);
+            if (closeIdx !== -1) {
+              const inside = pendingText.slice(0, closeIdx);
+              pendingText = pendingText.slice(closeIdx + TOOL_CLOSE_TAG.length);
+              inToolCall = false;
+
+              const parsed = parseSingleToolCallPayload(inside);
+              if (parsed) {
+                emitToolCall(parsed);
+              } else {
+                emittedAny = true;
+                sendDelta({ content: `${TOOL_OPEN_TAG}${inside}${TOOL_CLOSE_TAG}` });
+              }
+              continue;
+            }
+
+            if (isEOF) {
+              // Model quên thẻ đóng </tool_call> -> vẫn thử parse JSON
+              const parsed = parseSingleToolCallPayload(pendingText);
+              if (parsed) {
+                emitToolCall(parsed);
+              } else if (pendingText) {
+                emittedAny = true;
+                sendDelta({ content: `${TOOL_OPEN_TAG}${pendingText}` });
+              }
+              pendingText = "";
+              inToolCall = false;
+              break;
+            }
+
+            // Đang chờ đủ nội dung tới </tool_call>
+            break;
+          }
+        }
       };
 
       const processLine = (line) => {
@@ -3753,8 +4039,8 @@ async function handleGeminiWebInDO(doInstance, { keyId, cookieStr, model, stream
             : extracted.text;
           lastText = extracted.text;
           if (tDelta) {
-            emittedAny = true;
-            sendDelta({ content: tDelta });
+            pendingText += tDelta;
+            drainToolAwareBuffer(false);
           }
         }
       };
@@ -3769,11 +4055,12 @@ async function handleGeminiWebInDO(doInstance, { keyId, cookieStr, model, stream
           for (const line of lines) processLine(line);
         }
         if (buffer.trim()) processLine(buffer);
+        drainToolAwareBuffer(true);
 
         if (!emittedAny) {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: "Gemini Web không trả về nội dung (cookie hết hạn hoặc bị chặn)" } })}\n\n`));
         } else {
-          sendDelta({}, "stop");
+          sendDelta({}, toolCallIndex > 0 ? "tool_calls" : "stop");
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         }
       } catch (err) {
@@ -3796,6 +4083,17 @@ async function handleGeminiWebInDO(doInstance, { keyId, cookieStr, model, stream
   });
 }
 
+function extractNestedStrings(node, out = []) {
+  if (typeof node === "string") {
+    if (node.trim()) out.push(node);
+    return out;
+  }
+  if (Array.isArray(node)) {
+    for (const item of node) extractNestedStrings(item, out);
+  }
+  return out;
+}
+
 function extractTextFromGeminiLine(rawLine) {
   const line = String(rawLine || "").trim();
   if (!line.startsWith("[")) return null;
@@ -3808,7 +4106,14 @@ function extractTextFromGeminiLine(rawLine) {
         const candidate = inner?.[4]?.[0];
         if (!candidate) continue;
         const text = typeof candidate?.[1]?.[0] === "string" ? candidate[1][0] : "";
-        const reasoning = typeof candidate?.[37]?.[0]?.[0] === "string" ? candidate[37][0][0] : "";
+        let reasoning = "";
+        if (candidate?.[37]) {
+          if (typeof candidate[37]?.[0]?.[0] === "string") {
+            reasoning = candidate[37][0][0];
+          } else {
+            reasoning = extractNestedStrings(candidate[37]).join("\n\n");
+          }
+        }
         if (text || reasoning) return { text, reasoning };
       }
     }

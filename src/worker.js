@@ -1,8 +1,8 @@
 // ============================================================================
-// Cloudflare Worker AI Gateway v3.3.0
+// Cloudflare Worker AI Gateway v3.3.1
 // - Full Protocol Translation: OpenAI Responses <-> Chat Completions <-> Anthropic Messages
 // - Built-in Gemini Web Adapter (apiType: "gemini-web") running inside Durable Object
-//   + Tool Calling Emulation (XML <tool_call> <-> OpenAI/Anthropic tool_calls & tool_results)
+//   + Tool Calling Emulation (External Client Tool Bridge XML <tool_call> <-> tool_calls)
 //   + Thinking/Reasoning extraction & cumulative-delta deduplication
 // - Smart Key Health, Circuit Breaker & EWMA TTFB (Global via Durable Object)
 // - First-Chunk SSE Peek (Fake 200 OK error detection & seamless failover)
@@ -21,13 +21,13 @@ const CORS_HEADERS = {
 };
 
 const CONFIG = {
-  VERSION: "3.3.0",
+  VERSION: "3.3.1",
   MAX_RETRY_KEYS_PER_UPSTREAM: 6,
   TRANSIENT_RETRIES: 2,
   RETRY_BASE_DELAY_MS: 400,
   CONNECT_TIMEOUT_MS: 25000,
-  FIRST_CHUNK_TIMEOUT_MS: 45000, // Tăng lên 45s cho các model Thinking High suy nghĩ sâu
-  STREAM_IDLE_TIMEOUT_MS: 60000, // Tăng lên 60s tránh cắt nhầm giữa giai đoạn suy luận
+  FIRST_CHUNK_TIMEOUT_MS: 45000, // 45s cho các model Thinking High suy nghĩ sâu
+  STREAM_IDLE_TIMEOUT_MS: 60000, // 60s tránh cắt nhầm giữa giai đoạn suy luận
   HEARTBEAT_INTERVAL_MS: 15000,
   MODELS_TIMEOUT_MS: 6000,
   MODELS_CACHE_TTL_MS: 60000,
@@ -3557,24 +3557,27 @@ function buildToolSystemInstruction(tools, toolChoice) {
 
   let choiceRule = "";
   if (toolChoice === "required") {
-    choiceRule = "\n- You MUST invoke at least one tool in this turn.";
+    choiceRule = "\n- You MUST output at least one <tool_call> block in this response.";
   } else if (typeof toolChoice === "object" && (toolChoice?.function?.name || toolChoice?.name)) {
     const forcedName = toolChoice.function?.name || toolChoice.name;
-    choiceRule = `\n- You MUST invoke the tool named "${forcedName}" in this turn.`;
+    choiceRule = `\n- You MUST output a <tool_call> block for "${forcedName}" in this response.`;
   }
 
   return [
-    "### TOOL CALLING PROTOCOL (STRICT)",
-    "You have access to the following tools:",
+    "### EXTERNAL CLIENT TOOL BRIDGE (FORMAT SPECIFICATION)",
+    "You are acting as the reasoning backend connected to an external local coding client.",
+    "You do NOT execute tools or access local files yourself. Instead, the external client intercepts your output, executes any requested tool on the user's machine, and returns the output inside <tool_result>...</tool_result> in the next message.",
+    "Therefore, NEVER refuse a request by saying you lack access to local files, tools, or the filesystem. Simply emit the structured tool request below so the client can run it.",
+    "",
+    "Available client tools (JSON schema):",
     JSON.stringify(normalized),
     "",
-    "Rules for invoking tools:",
-    `- To call a tool, output a ${TOOL_OPEN_TAG} block containing ONLY valid JSON with "name" and "arguments" keys:`,
-    `  ${TOOL_OPEN_TAG}{"name":"tool_name","arguments":{"param":"value"}}${TOOL_CLOSE_TAG}`,
-    "- Do NOT wrap <tool_call> blocks in markdown code fences (no ```json or ```xml).",
-    "- You may emit multiple <tool_call> blocks in one response for parallel tool calls.",
-    "- After emitting <tool_call> block(s), STOP and wait for the <tool_result> response. Do not fabricate tool outputs.",
-    `- If no tool is needed, reply normally without using ${TOOL_OPEN_TAG}.${choiceRule}`
+    "Output format rules:",
+    `- Emit ONLY this exact XML tag with valid JSON inside: ${TOOL_OPEN_TAG}{"name":"TOOL_NAME","arguments":{...}}${TOOL_CLOSE_TAG}`,
+    `- Example: ${TOOL_OPEN_TAG}{"name":"${normalized[0].name}","arguments":{}}${TOOL_CLOSE_TAG}`,
+    "- Do NOT wrap <tool_call> in markdown code blocks.",
+    "- Stop immediately after emitting <tool_call> block(s) and wait for <tool_result>.",
+    `- Only reply with normal text when no client tool is needed.${choiceRule}`
   ].join("\n");
 }
 
@@ -3663,9 +3666,12 @@ function flattenChatMessagesToPrompt(chat, tools = []) {
 
   const finalBlocks = [];
   if (sysParts.length > 0) {
-    finalBlocks.push(`[System]\n${sysParts.join("\n\n")}`);
+    finalBlocks.push(`[System Instructions]\n${sysParts.join("\n\n")}`);
   }
   finalBlocks.push(...convParts);
+  if (tools.length > 0) {
+    finalBlocks.push(`[Reminder: If a tool is needed, output ONLY ${TOOL_OPEN_TAG}{"name":"...","arguments":{...}}${TOOL_CLOSE_TAG} so the external client can execute it. Do not claim you lack local access.]`);
+  }
   return finalBlocks.join("\n\n") || "Hello";
 }
 
@@ -3962,7 +3968,6 @@ async function handleGeminiWebInDO(doInstance, { keyId, cookieStr, model, stream
             }
 
             if (isEOF) {
-              // Không xả khoảng trắng thừa nếu đã gọi tool
               if (pendingText.trim() || toolCallIndex === 0) {
                 emittedAny = true;
                 sendDelta({ content: pendingText });

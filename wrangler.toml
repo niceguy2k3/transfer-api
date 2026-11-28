@@ -1,6 +1,7 @@
 name = "namnam-api"
 main = "src/worker.js"
 compatibility_date = "2026-01-01"
+keep_vars = true
 
 [[durable_objects.bindings]]
 name = "GATEWAY_STATE"

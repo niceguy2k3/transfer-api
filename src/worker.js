@@ -1,8 +1,8 @@
 // ============================================================================
-// Cloudflare Worker AI Gateway v3.3.1
+// Cloudflare Worker AI Gateway v3.3.2
 // - Full Protocol Translation: OpenAI Responses <-> Chat Completions <-> Anthropic Messages
 // - Built-in Gemini Web Adapter (apiType: "gemini-web") running inside Durable Object
-//   + Tool Calling Emulation (External Client Tool Bridge XML <tool_call> <-> tool_calls)
+//   + Tool Calling Emulation (Client Tool Harness Protocol <tool_call> <-> tool_calls)
 //   + Thinking/Reasoning extraction & cumulative-delta deduplication
 // - Smart Key Health, Circuit Breaker & EWMA TTFB (Global via Durable Object)
 // - First-Chunk SSE Peek (Fake 200 OK error detection & seamless failover)
@@ -21,7 +21,7 @@ const CORS_HEADERS = {
 };
 
 const CONFIG = {
-  VERSION: "3.3.1",
+  VERSION: "3.3.2",
   MAX_RETRY_KEYS_PER_UPSTREAM: 6,
   TRANSIENT_RETRIES: 2,
   RETRY_BASE_DELAY_MS: 400,
@@ -3099,7 +3099,7 @@ function renderAdminHTML() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI Gateway v3.3 — Admin Dashboard</title>
+<title>AI Gateway v3.3.2 — Admin Dashboard</title>
 <style>
   :root { --bg:#0b0f17; --card:#121826; --border:#1f2937; --text:#e5e7eb; --muted:#9ca3af; --accent:#3b82f6; --green:#10b981; --yellow:#f59e0b; --red:#ef4444; }
   * { box-sizing:border-box; }
@@ -3144,7 +3144,7 @@ function renderAdminHTML() {
 </head>
 <body>
 <div id="loginBox" class="card">
-  <h2 style="margin-top:0">AI Gateway v3.3 Admin</h2>
+  <h2 style="margin-top:0">AI Gateway v3.3.2 Admin</h2>
   <p style="color:var(--muted);font-size:13px">Nhập <b>ADMIN_KEY</b> (hoặc WORKER_AUTH_KEY) để đăng nhập.</p>
   <input id="adminKeyInput" type="password" placeholder="Admin Key..." style="width:100%;margin-bottom:12px" onkeydown="if(event.key==='Enter')doLogin()">
   <button class="primary" style="width:100%;padding:9px" onclick="doLogin()">Đăng nhập</button>
@@ -3153,7 +3153,7 @@ function renderAdminHTML() {
 
 <div id="app" class="hidden">
   <header>
-    <h1>⚡ AI Gateway <span id="verBadge" class="badge">v3.3</span> <span id="storageBadge" class="badge">...</span></h1>
+    <h1>⚡ AI Gateway <span id="verBadge" class="badge">v3.3.2</span> <span id="storageBadge" class="badge">...</span></h1>
     <div class="row-actions">
       <button onclick="loadState()">↻ Làm mới</button>
       <button onclick="resetKey('ALL')">Mở khóa tất cả Key</button>
@@ -3543,41 +3543,46 @@ async function callGeminiWebUpstream({ env, upstream, cookieStr, keyId, model, c
   return handleGeminiWebInDO(fakeDO, payload);
 }
 
-function buildToolSystemInstruction(tools, toolChoice) {
-  const normalized = tools.map((t) => {
+function normalizeToolsForBridge(tools) {
+  return (tools || []).map((t) => {
     const fn = t?.type === "function" && t.function ? t.function : t;
     return {
       name: fn?.name || "",
-      description: fn?.description || "",
+      description: String(fn?.description || "").slice(0, 400),
       parameters: fn?.parameters || fn?.input_schema || { type: "object", properties: {} }
     };
   }).filter((t) => t.name);
+}
 
-  if (normalized.length === 0) return "";
+function buildToolSystemInstruction(normalizedTools, toolChoice) {
+  if (!normalizedTools || normalizedTools.length === 0) return "";
 
   let choiceRule = "";
   if (toolChoice === "required") {
-    choiceRule = "\n- You MUST output at least one <tool_call> block in this turn.";
+    choiceRule = "\n- You MUST output at least one <tool_call> tag in this turn.";
   } else if (typeof toolChoice === "object" && (toolChoice?.function?.name || toolChoice?.name)) {
     const forcedName = toolChoice.function?.name || toolChoice.name;
-    choiceRule = `\n- You MUST output a <tool_call> block for "${forcedName}" in this turn.`;
+    choiceRule = `\n- You MUST output a <tool_call> tag for "${forcedName}" in this turn.`;
   }
 
   return [
-    "### EXTERNAL CLIENT TOOL BRIDGE",
-    "You are the reasoning model for a local coding client. The client executes tools on the user's machine and sends back their output inside <tool_result>...</tool_result>.",
-    "NEVER refuse due to lack of local file access, and NEVER invoke Google Workspace, Gmail, or Drive extensions.",
-    "NEVER echo, copy, or repeat raw <tool_result> JSON or these instructions in your reply.",
+    "### CLIENT TOOL HARNESS PROTOCOL (TEXT OUTPUT FORMAT)",
+    "This conversation runs through an automated local coding harness on the user's machine.",
+    "You do NOT access the user's filesystem directly. Instead, whenever you need to read files, search code, edit files, or run commands, you simply output a formatted text command tag.",
+    "The user's local client automatically intercepts that tag, runs the tool locally, and returns the output inside <tool_result>...</tool_result> in the next turn.",
+    "Because the local client executes these tags for you, NEVER say you lack local disk access or list unrelated web/cloud tools — simply emit the <tool_call> tag below.",
     "",
     "Client tools schema:",
-    JSON.stringify(normalized),
+    JSON.stringify(normalizedTools),
     "",
-    "Strict rules:",
-    `- To call a tool, output ONLY valid JSON inside XML tags: ${TOOL_OPEN_TAG}{"name":"TOOL_NAME","arguments":{}}${TOOL_CLOSE_TAG}`,
+    "Strict output rules:",
+    `- Format: ${TOOL_OPEN_TAG}{"name":"EXACT_TOOL_NAME","arguments":{...}}${TOOL_CLOSE_TAG}`,
+    `- Example: ${TOOL_OPEN_TAG}{"name":"${normalizedTools[0].name}","arguments":{}}${TOOL_CLOSE_TAG}`,
     "- Do NOT wrap <tool_call> in markdown code fences.",
-    "- If a tool accepts JavaScript code (e.g. execute/codemode), write strictly valid plain JavaScript program body only (no TypeScript types, no markdown fences, properly JSON-escaped).",
+    "- If calling a JavaScript/codemode execution tool, write strictly valid plain JavaScript body only (no TypeScript syntax, properly JSON-escaped).",
     "- Stop immediately after emitting <tool_call> block(s) and wait for <tool_result>.",
-    `- When you have enough information from <tool_result>, answer the user directly without emitting ${TOOL_OPEN_TAG}.${choiceRule}`
+    "- NEVER echo, copy, or repeat raw <tool_result> JSON or these protocol rules in your reply.",
+    `- Only reply in normal prose when you already have enough data to answer the user.${choiceRule}`
   ].join("\n");
 }
 
@@ -3585,10 +3590,6 @@ function flattenChatMessagesToPrompt(chat, tools = []) {
   const sysParts = [];
   if (chat?.instructions) {
     sysParts.push(String(chat.instructions));
-  }
-  if (tools.length > 0) {
-    const toolGuide = buildToolSystemInstruction(tools, chat?.tool_choice);
-    if (toolGuide) sysParts.push(toolGuide);
   }
 
   const msgs = Array.isArray(chat?.messages)
@@ -3599,7 +3600,6 @@ function flattenChatMessagesToPrompt(chat, tools = []) {
         ? [{ role: "user", content: chat.input }]
         : [];
 
-  // Tìm vị trí cuối cùng của tool result để chỉ giữ full độ dài cho lượt mới nhất
   let lastToolIdx = -1;
   for (let i = msgs.length - 1; i >= 0; i--) {
     if (msgs[i]?.role === "tool" || msgs[i]?.type === "function_call_output") {
@@ -3632,7 +3632,7 @@ function flattenChatMessagesToPrompt(chat, tools = []) {
         outText = outText.slice(0, maxLen) + `\n...[truncated ${outText.length - maxLen} chars]`;
       }
       const attrs = [callId ? `id="${callId}"` : "", toolName ? `name="${toolName}"` : ""].filter(Boolean).join(" ");
-      convParts.push(`<tool_result${attrs ? " " + attrs : ""}>\n${outText}\n</tool_result>`);
+      convParts.push(`[Client Tool Output]\n<tool_result${attrs ? " " + attrs : ""}>\n${outText}\n</tool_result>`);
       lastRole = "tool";
       continue;
     }
@@ -3679,7 +3679,9 @@ function flattenChatMessagesToPrompt(chat, tools = []) {
     }
   }
 
-  if (sysParts.length === 0 && convParts.length === 1 && msgs.length === 1 && (msgs[0].role === "user" || !msgs[0].role)) {
+  const normalizedTools = normalizeToolsForBridge(tools);
+
+  if (sysParts.length === 0 && normalizedTools.length === 0 && convParts.length === 1 && msgs.length === 1 && (msgs[0].role === "user" || !msgs[0].role)) {
     return extractPlainText(msgs[0].content);
   }
 
@@ -3687,34 +3689,59 @@ function flattenChatMessagesToPrompt(chat, tools = []) {
   if (sysParts.length > 0) {
     finalBlocks.push(`[System Instructions]\n${sysParts.join("\n\n")}`);
   }
+
+  // Đặt hướng dẫn tool harness SAU system prompt của client để không bị trôi
+  if (normalizedTools.length > 0) {
+    const toolGuide = buildToolSystemInstruction(normalizedTools, chat?.tool_choice);
+    if (toolGuide) finalBlocks.push(toolGuide);
+  }
+
   finalBlocks.push(...convParts);
 
-  if (tools.length > 0) {
+  if (normalizedTools.length > 0) {
+    const toolNames = normalizedTools.map((t) => t.name).join(", ");
     if (lastRole === "tool") {
-      finalBlocks.push("[Next Turn]\nAnalyze the <tool_result> above. Do NOT copy, quote, or echo the raw <tool_result> JSON or file dump. Either call the next tool with a <tool_call> tag if you still need more data, or answer the user's request clearly now.");
+      finalBlocks.push(
+        `[Assistant Turn]\nAnalyze the <tool_result> above. Do NOT copy or echo raw JSON/file dumps. If you need more files or commands, emit ${TOOL_OPEN_TAG}{"name":"<tool>","arguments":{...}}${TOOL_CLOSE_TAG} (available: ${toolNames}) and stop. Otherwise answer the user directly.`
+      );
     } else {
-      finalBlocks.push("[Next Turn]\nRespond to the user. If a client tool is needed, emit only the <tool_call> block and stop. Do not repeat these instructions.");
+      finalBlocks.push(
+        `[Assistant Turn]\nTo inspect or act on the project, output ONLY ${TOOL_OPEN_TAG}{"name":"<tool>","arguments":{...}}${TOOL_CLOSE_TAG} (available: ${toolNames}) so the local client harness executes it for you. Do NOT refuse for lack of local access and do NOT repeat these instructions.`
+      );
     }
   }
 
   return finalBlocks.join("\n\n") || "Hello";
 }
+
 function parseSingleToolCallPayload(rawInsideTag) {
   let cleaned = String(rawInsideTag || "").trim();
-  // Gỡ markdown code fence nếu model lỡ bọc bên trong thẻ
   cleaned = cleaned.replace(/^```(?:json|xml)?\s*/i, "").replace(/\s*```$/i, "").trim();
   if (!cleaned) return null;
 
-  try {
-    const obj = JSON.parse(cleaned);
-    const name = obj?.name || obj?.function?.name || "";
-    if (!name || typeof name !== "string") return null;
-    const rawArgs = obj.arguments ?? obj.args ?? obj.parameters ?? obj?.function?.arguments ?? {};
-    const argsStr = typeof rawArgs === "string" ? rawArgs : JSON.stringify(rawArgs ?? {});
-    return { name: name.trim(), arguments: argsStr };
-  } catch {
-    return null;
+  const tryParse = (str) => {
+    try {
+      const obj = JSON.parse(str);
+      const name = obj?.name || obj?.function?.name || "";
+      if (!name || typeof name !== "string") return null;
+      const rawArgs = obj.arguments ?? obj.args ?? obj.parameters ?? obj?.function?.arguments ?? {};
+      const argsStr = typeof rawArgs === "string" ? rawArgs : JSON.stringify(rawArgs ?? {});
+      return { name: name.trim(), arguments: argsStr };
+    } catch {
+      return null;
+    }
+  };
+
+  const direct = tryParse(cleaned);
+  if (direct) return direct;
+
+  // Fallback nếu có ký tự thừa quanh object JSON
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    return tryParse(cleaned.slice(firstBrace, lastBrace + 1));
   }
+  return null;
 }
 
 function extractToolCallsFromFullText(fullText) {

@@ -1,5 +1,5 @@
 // ============================================================================
-// Cloudflare Worker AI Gateway v3.0
+// Cloudflare Worker AI Gateway v3.1.0
 // - Full Protocol Translation: OpenAI Responses <-> Chat Completions <-> Anthropic Messages
 // - Smart Key Health, Circuit Breaker & EWMA TTFB (Global via Durable Object)
 // - First-Chunk SSE Peek (Fake 200 OK error detection & seamless failover)
@@ -7,7 +7,7 @@
 // - Cross-Upstream Failover & Model Aliasing
 // - Auto-Sanitize Payload & Thinking/Reasoning Bidirectional Mapping
 // - Stream Cancellation (no leaked tokens on client Stop), Idle Timeout & Heartbeat
-// - Virtual Keys with RPM Limiting + Built-in /admin Dashboard
+// - Virtual Keys with RPM Limiting + Built-in /admin Dashboard + Live Models Explorer Tab
 // ============================================================================
 
 const CORS_HEADERS = {
@@ -18,7 +18,7 @@ const CORS_HEADERS = {
 };
 
 const CONFIG = {
-  VERSION: "3.0.0",
+  VERSION: "3.1.0",
   MAX_RETRY_KEYS_PER_UPSTREAM: 6,
   TRANSIENT_RETRIES: 2,
   RETRY_BASE_DELAY_MS: 400,
@@ -46,7 +46,7 @@ const ALLOWED_CLIENT_UA_REGEX = /(codex|claude|cursor|kilo|cline|roo|opencode|tr
 const REASONING_MODEL_REGEX = /(^|\/)(o1|o3|o4|gpt-5|codex|deepseek-reasoner|deepseek-r1|qwq)/i;
 const SANITIZE_400_REGEX = /(unsupported parameter|unknown parameter|not supported with this model|does not support|invalid_request_error|temperature|top_p|reasoning|max_tokens|max_completion_tokens|stream_options)/i;
 
-// Local isolate mirror (giảm độ trễ đọc DO xuống ~0ms)
+// Local isolate mirror
 let modelsCache = { expiresAt: 0, payload: null };
 const localState = {
   syncedAt: 0,
@@ -103,7 +103,6 @@ export default {
       });
     }
 
-    // Đồng bộ nhẹ state từ Durable Object (không block quá lâu)
     await syncLocalStateFromDO(env, false);
 
     // 3. Authentication (Master Key hoặc Virtual Key + RPM limit)
@@ -115,7 +114,7 @@ export default {
       }, authResult.status);
     }
 
-    // 4. Models list (with Isolate + KV Cache + Aliases)
+    // 4. Models list (Isolate + KV Cache + Aliases)
     if ((subPath === "models" || subPath.endsWith("/models")) && request.method === "GET") {
       return handleModelsRoute(request, env, ctx, url, upstreamConfig, modelAliases);
     }
@@ -153,7 +152,7 @@ export default {
       }
     }
 
-    // 6. Build Cross-Upstream Failover Chain & Sticky Hash
+    // 6. Cross-Upstream Failover Chain & Sticky Hash
     const candidateUpstreams = buildCandidateUpstreams(upstreamConfig, detectedUpstreamName, realModelName);
     const stickyHash = computeStickyHash(bodyJson, authResult.keyLabel);
     const clientStreamRequested = Boolean(bodyJson && bodyJson.stream);
@@ -213,7 +212,7 @@ export default {
       }, 502);
     }
 
-    // 8. Transform / Stream Response with Cancellation, Idle Timeout, Heartbeat & Token Accounting
+    // 8. Transform / Stream Response
     const {
       response,
       peekedReader,
@@ -328,7 +327,6 @@ export default {
       return jsonResponse(convertChatJsonToAnthropic(chatObj, effectiveModel), response.status, extraDebugHeaders);
     }
 
-    // Native passthrough (SSE with heartbeat/idle-timeout/usage spy or plain JSON)
     if (isEventStream) {
       return passthroughSSEStream({
         reader: peekedReader,
@@ -340,7 +338,6 @@ export default {
       });
     }
 
-    // Plain JSON passthrough (read clone only if JSON to track usage)
     if (resContentType.includes("application/json")) {
       const clonedText = await response.clone().text().catch(() => "");
       if (clonedText) {
@@ -403,11 +400,9 @@ async function executeAcrossUpstreams(params) {
       continue;
     }
 
-    // Chọn key thông minh: ưu tiên Sticky Key khỏe -> Healthy keys theo TTFB -> Cooldown sắp hết hạn
     const orderedKeys = selectOrderedKeys(upstream.name, rawKeys, stickyHash).slice(0, CONFIG.MAX_RETRY_KEYS_PER_UPSTREAM);
     if (orderedKeys.length === 0) continue;
 
-    // Build payload tương ứng với giao thức của upstream hiện tại
     const effectiveModel = mapModelForUpstream(upstream, realModelName);
     const routePlan = buildUpstreamRequestPlan({
       upstream,
@@ -454,7 +449,6 @@ async function executeAcrossUpstreams(params) {
         if (res.ok) {
           const ct = (res.headers.get("content-type") || "").toLowerCase();
 
-          // A. Kiểm tra JSON 200 giả chứa lỗi quota/token thấp
           if (ct.includes("application/json")) {
             const jsonCheck = await inspectJson200ForSoftError(res);
             if (jsonCheck.isSoftError) {
@@ -495,7 +489,6 @@ async function executeAcrossUpstreams(params) {
             };
           }
 
-          // B. First-Chunk Peek cho SSE stream (bắt lỗi 200 OK giả ở chunk đầu)
           if (ct.includes("text/event-stream") && res.body) {
             const peekResult = await peekFirstSSEChunk(res.body, abortController, CONFIG.FIRST_CHUNK_TIMEOUT_MS);
             if (!peekResult.ok) {
@@ -539,7 +532,6 @@ async function executeAcrossUpstreams(params) {
             };
           }
 
-          // Các Content-Type khác (binary/plain)
           reportKeyOutcome(env, ctx, {
             keyId: keyEntry.keyId,
             upstream: upstream.name,
@@ -562,12 +554,10 @@ async function executeAcrossUpstreams(params) {
           };
         }
 
-        // Xử lý HTTP non-2xx
         lastErrorResponse = res;
         const errBodySnippet = await res.clone().text().then((t) => t.slice(0, 350)).catch(() => "");
         errorSummary = `HTTP ${res.status} (${upstream.name}): ${errBodySnippet.slice(0, 120)}`;
 
-        // Lỗi 400 do tham số không tương thích -> tự dọn payload và retry 1 lần trên cùng key
         if (res.status === 400 && !didSanitizeRetry && bodyJson && SANITIZE_400_REGEX.test(errBodySnippet)) {
           didSanitizeRetry = true;
           const sanitizedPlan = buildUpstreamRequestPlan({
@@ -584,22 +574,19 @@ async function executeAcrossUpstreams(params) {
             strictSanitize: true
           });
           bodyBuffer = sanitizedPlan.outgoingBodyText ? new TextEncoder().encode(sanitizedPlan.outgoingBodyText) : null;
-          attempt--; // thử lại ngay trên cùng key
+          attempt--;
           continue;
         }
 
-        // 404 (model không tồn tại ở upstream này) -> bỏ upstream này, nhảy sang fallback upstream tiếp theo
         if (res.status === 404) {
           failoverCount++;
           break;
         }
 
-        // 400 / 422 thật từ phía client (sau khi đã sanitize hoặc lỗi syntax) -> trả thẳng về client
         if (res.status === 400 || res.status === 422) {
           return { ok: false, lastErrorResponse, lastUpstream, lastKeyMask, lastResponseMode, errorSummary, failoverCount };
         }
 
-        // 401 / 403 -> đánh dấu key chết 20 phút và xoay key
         if (res.status === 401 || res.status === 403) {
           failoverCount++;
           reportKeyOutcome(env, ctx, {
@@ -615,7 +602,6 @@ async function executeAcrossUpstreams(params) {
           continue;
         }
 
-        // 429 Rate Limit -> đọc Retry-After, đánh dấu cooldown và xoay key
         if (res.status === 429) {
           failoverCount++;
           const retryAfterMs = parseRetryAfterMs(res.headers.get("retry-after")) || CONFIG.COOLDOWN_RATE_LIMIT_DEFAULT_MS;
@@ -630,14 +616,13 @@ async function executeAcrossUpstreams(params) {
           });
           transientCount++;
           if (attempt + 1 >= orderedKeys.length) {
-            if (uIdx + 1 < candidateUpstreams.length) break; // nhảy sang upstream dự phòng ngay thay vì ngủ chờ
+            if (uIdx + 1 < candidateUpstreams.length) break;
             if (transientCount > CONFIG.TRANSIENT_RETRIES) break;
             await sleep(Math.min(CONFIG.RETRY_BASE_DELAY_MS * Math.pow(2, transientCount), 3000));
           }
           continue;
         }
 
-        // 408 / 5xx -> đánh dấu transient cooldown ngắn và xoay key
         if ([408, 500, 502, 503, 504, 520, 522, 524].includes(res.status)) {
           failoverCount++;
           transientCount++;
@@ -716,7 +701,6 @@ async function peekFirstSSEChunk(bodyStream, abortController, timeoutMs) {
       bufferedChunks.push(value);
       textBuffer += decoder.decode(value, { stream: true });
 
-      // Phân tích các dòng đã hoàn chỉnh để kiểm tra event đầu tiên
       const lines = textBuffer.split("\n");
       for (let i = 0; i < lines.length - 1; i++) {
         const line = lines[i].trim();
@@ -734,11 +718,10 @@ async function peekFirstSSEChunk(bodyStream, abortController, timeoutMs) {
               return { ok: false, error: sseErr };
             }
           } catch {
-            // Không phải JSON chuẩn -> cứ cho qua để downstream xử lý
+            // ignore
           }
           return { ok: true, reader: createPrependedReader(bufferedChunks, reader) };
         }
-        // Nếu upstream trả JSON lỗi trực tiếp dù header là text/event-stream
         if (line.startsWith("{")) {
           try {
             const obj = JSON.parse(line);
@@ -748,12 +731,11 @@ async function peekFirstSSEChunk(bodyStream, abortController, timeoutMs) {
               return { ok: false, error: sseErr };
             }
           } catch {
-            // Chưa đủ JSON
+            // ignore
           }
         }
       }
 
-      // Tránh buffer quá lớn nếu upstream gửi cục text khổng lồ không xuống dòng
       if (textBuffer.length > 65536) {
         return { ok: true, reader: createPrependedReader(bufferedChunks, reader) };
       }
@@ -811,7 +793,7 @@ async function inspectJson200ForSoftError(res) {
       return { isSoftError: true, reason: errCode || errMsg || "insufficient_quota" };
     }
   } catch {
-    // ignore parse error
+    // ignore
   }
   return { isSoftError: false };
 }
@@ -847,7 +829,6 @@ function buildUpstreamRequestPlan({
     const clonedBody = { ...bodyJson, model: effectiveModel };
 
     if (isAnthropicRoute && isAnthropicNative) {
-      // Upstream hỗ trợ sẵn Anthropic /v1/messages -> passthrough trực tiếp
       targetSubPath = "messages";
       responseMode = "passthrough";
       outgoingPayloadObj = clonedBody;
@@ -913,7 +894,6 @@ function buildCandidateUpstreams(upstreamConfig, detectedName, realModelName) {
 
   pushUnique(primary);
 
-  // 1. Explicit fallbackUpstreams trên primary
   if (Array.isArray(primary?.fallbackUpstreams)) {
     for (const fbName of primary.fallbackUpstreams) {
       const found = upstreamConfig.find((u) => String(u.name || "").toLowerCase() === String(fbName).toLowerCase());
@@ -921,7 +901,6 @@ function buildCandidateUpstreams(upstreamConfig, detectedName, realModelName) {
     }
   }
 
-  // 2. Các upstream khác cũng khai báo hỗ trợ model này (xếp theo priority)
   if (realModelName) {
     const others = upstreamConfig
       .filter((u) => !added.has(u.name) && upstreamSupportsModel(u, realModelName))
@@ -1004,11 +983,9 @@ function selectOrderedKeys(upstreamName, rawKeys, stickyHash) {
   const cooling = entries.filter((e) => e.isCoolingDown).sort((a, b) => a.cooldownUntil - b.cooldownUntil);
 
   if (healthy.length > 1) {
-    // 1. Giữ nguyên Sticky Key ở vị trí đầu để ăn trọn Prompt Caching
     const stickyIdx = stickyHash % healthy.length;
     const pinned = healthy[stickyIdx];
     const rest = healthy.filter((_, idx) => idx !== stickyIdx);
-    // 2. Các key dự phòng xếp theo EWMA TTFB nhanh nhất
     rest.sort((a, b) => a.ewmaTtfb - b.ewmaTtfb);
     return [pinned, ...rest, ...cooling];
   }
@@ -1071,7 +1048,7 @@ function parseRetryAfterMs(headerVal) {
 }
 
 // ============================================================================
-// PAYLOAD CONVERTERS & AUTO-SANITIZER (BUGS 1, 2, 4 FIXED)
+// PAYLOAD CONVERTERS & AUTO-SANITIZER
 // ============================================================================
 function mapThinkingBudgetToEffort(budget) {
   const n = Number(budget || 0);
@@ -1310,7 +1287,6 @@ function convertAnthropicToResponsesPayload(anth, stream, strictCodex, shouldStr
   if (anth.top_p !== undefined) payload.top_p = anth.top_p;
   if (anth.max_tokens !== undefined) payload.max_output_tokens = anth.max_tokens;
 
-  // Dịch Anthropic thinking -> OpenAI Responses reasoning
   if (anth.thinking?.type === "enabled") {
     payload.reasoning = {
       effort: mapThinkingBudgetToEffort(anth.thinking.budget_tokens),
@@ -1405,7 +1381,6 @@ function convertAnthropicToOpenAIPayload(anth, stream, shouldStripSampling, stri
     stream: Boolean(stream)
   };
 
-  // Yêu cầu upstream trả usage ở chunk cuối khi stream để điền đúng output_tokens cho Anthropic
   if (stream && !strictSanitize) {
     payload.stream_options = { include_usage: true };
   }
@@ -1502,7 +1477,6 @@ function createManagedSSEResponse({ reader, abortController, headers, status = 2
       }
     },
     async cancel() {
-      // Client bấm Stop / đóng kết nối -> cắt upstream ngay để không rò rỉ token
       closed = true;
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       try {
@@ -1545,7 +1519,6 @@ function passthroughSSEStream({ reader, abortController, responseHeaders, status
           if (done) break;
           safeEnqueue(value);
 
-          // Đọc thụ động usage từ dòng cuối để thống kê lên /admin
           spyBuffer += decoder.decode(value, { stream: true });
           const lines = spyBuffer.split("\n");
           spyBuffer = lines.pop() || "";
@@ -1695,7 +1668,6 @@ function streamResponsesToChatCompletions({ reader, abortController, fallbackMod
   });
 }
 
-// FIXED: Hỗ trợ thinking, parallel tool calls không bị trộn JSON, input/output tokens và error events
 function streamResponsesToAnthropic({ reader, abortController, fallbackModel, extraHeaders, onFinishUsage }) {
   const headers = new Headers({
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -1722,9 +1694,7 @@ function streamResponsesToAnthropic({ reader, abortController, fallbackModel, ex
       let outputTokens = 0;
       let cachedTokens = 0;
       let streamErr = null;
-
-      // Buffer các tool call chạy song song để không trộn JSON trong cùng 1 content_block
-      const pendingTools = new Map(); // itemId -> { id, name, args, done }
+      const pendingTools = new Map();
 
       const emit = (event, data) => {
         safeEnqueue(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -1760,7 +1730,7 @@ function streamResponsesToAnthropic({ reader, abortController, fallbackModel, ex
             closeCurrentBlock();
           }
           pendingTools.delete(itemId);
-          if (!t.done) break; // Giữ tool đang dở làm active tool
+          if (!t.done) break;
         }
       };
 
@@ -1838,7 +1808,6 @@ function streamResponsesToAnthropic({ reader, abortController, fallbackModel, ex
               const name = evt.item.name || "";
 
               if (currentBlockType === "tool_use" && activeToolItemId && activeToolItemId !== itemId) {
-                // Có tool khác đang mở -> buffer lại, lát mở sau
                 pendingTools.set(itemId, { id: callId, name, args: "", done: false });
               } else {
                 closeCurrentBlock();
@@ -1886,7 +1855,6 @@ function streamResponsesToAnthropic({ reader, abortController, fallbackModel, ex
 
         if (!isClosed()) {
           closeCurrentBlock();
-          // Flush bất kỳ tool call nào còn nằm trong pending
           for (const [, t] of pendingTools.entries()) {
             currentBlockIndex++;
             emit("content_block_start", {
@@ -1929,7 +1897,6 @@ function streamResponsesToAnthropic({ reader, abortController, fallbackModel, ex
   });
 }
 
-// FIXED: Hỗ trợ đầy đủ delta.tool_calls, delta.reasoning_content, stop_reason thật và usage thật
 function streamChatCompletionsToAnthropic({ reader, abortController, fallbackModel, extraHeaders, onFinishUsage }) {
   const headers = new Headers({
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -1956,9 +1923,7 @@ function streamChatCompletionsToAnthropic({ reader, abortController, fallbackMod
       let outputTokens = 0;
       let cachedTokens = 0;
       let streamErr = null;
-
-      // Buffer cho tool call song song nếu OpenAI stream xen kẽ index 0 và 1
-      const openAITools = new Map(); // openaiIndex -> { id, name, args, emitted }
+      const openAITools = new Map();
 
       const emit = (event, data) => {
         safeEnqueue(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -2024,8 +1989,6 @@ function streamChatCompletionsToAnthropic({ reader, abortController, fallbackMod
             if (!choice) continue;
 
             const delta = choice.delta || {};
-
-            // 1. Reasoning / Thinking delta
             const reasoningDelta = delta.reasoning_content || delta.reasoning;
             if (reasoningDelta) {
               if (currentBlockType !== "thinking") {
@@ -2045,7 +2008,6 @@ function streamChatCompletionsToAnthropic({ reader, abortController, fallbackMod
               });
             }
 
-            // 2. Text content delta
             if (delta.content) {
               if (currentBlockType !== "text") {
                 closeCurrentBlock();
@@ -2064,7 +2026,6 @@ function streamChatCompletionsToAnthropic({ reader, abortController, fallbackMod
               });
             }
 
-            // 3. Tool calls delta
             if (Array.isArray(delta.tool_calls)) {
               hasToolUse = true;
               for (const tc of delta.tool_calls) {
@@ -2084,7 +2045,6 @@ function streamChatCompletionsToAnthropic({ reader, abortController, fallbackMod
                       content_block: { type: "tool_use", id, name, input: {} }
                     });
                   } else if (activeOpenAIToolIdx !== idx) {
-                    // Tool mới xuất hiện trong khi tool cũ đang stream -> buffer lại
                     openAITools.set(idx, { id, name, args: "", emitted: false });
                   }
                 } else {
@@ -2119,8 +2079,6 @@ function streamChatCompletionsToAnthropic({ reader, abortController, fallbackMod
 
         if (!isClosed()) {
           closeCurrentBlock();
-
-          // Flush các tool call còn lại đã buffer
           for (const [, entry] of openAITools.entries()) {
             if (entry.emitted) continue;
             currentBlockIndex++;
@@ -2412,7 +2370,7 @@ async function handleModelsRoute(request, env, ctx, url, upstreamConfig, modelAl
         return jsonResponse(kvCached, 200, { "X-Cache": "HIT-KV" });
       }
     } catch {
-      // ignore KV error
+      // ignore
     }
   }
 
@@ -2429,9 +2387,11 @@ async function handleModelsRoute(request, env, ctx, url, upstreamConfig, modelAl
       const res = await fetchWithTimeout(targetModelsUrl, { method: "GET", headers }, CONFIG.MODELS_TIMEOUT_MS);
       if (res.ok) {
         const rawData = await res.json();
-        const rawList = Array.isArray(rawData) ? rawData : (rawData && Array.isArray(rawData.data) ? rawData.data : []);
-        return rawList.filter((m) => m && m.id).map((m) => {
-          const baseId = String(m.id).replace(/\s*\(.*?\)/g, "").trim();
+        const rawList = Array.isArray(rawData)
+          ? rawData
+          : (rawData && Array.isArray(rawData.data) ? rawData.data : (Array.isArray(rawData?.models) ? rawData.models : []));
+        return rawList.filter((m) => m && (m.id || m.name)).map((m) => {
+          const baseId = String(m.id || m.name).replace(/\s*\(.*?\)/g, "").trim();
           const displayId = upstreamConfig.length > 1 ? `${baseId} (${upstream.name})` : baseId;
           return { ...m, id: displayId, owned_by: upstream.name };
         });
@@ -2445,7 +2405,6 @@ async function handleModelsRoute(request, env, ctx, url, upstreamConfig, modelAl
   const results = await Promise.allSettled(fetchPromises);
   const finalModels = [];
 
-  // Đưa Model Aliases lên đầu danh sách
   for (const [alias, target] of Object.entries(modelAliases)) {
     finalModels.push({ id: alias, object: "model", owned_by: `alias -> ${target}` });
   }
@@ -2485,7 +2444,6 @@ async function authenticateRequest(clientKey, env) {
     return { ok: true, keyLabel: "master" };
   }
 
-  // Kiểm tra Virtual Keys (nếu có cấu hình trong DO hoặc env)
   if (clientKey && localState.virtualKeys && localState.virtualKeys[clientKey]) {
     const vk = localState.virtualKeys[clientKey];
     if (!vk.enabled) {
@@ -2538,13 +2496,13 @@ async function syncLocalStateFromDO(env, force = false) {
       localState.syncedAt = Date.now();
     }
   } catch {
-    // fallback dùng localState hiện tại
+    // ignore
   }
 }
 
 async function checkVirtualKeyRpm(env, token, rpmLimit) {
   const stub = getDOStub(env);
-  if (!stub) return true; // không có DO thì cho qua
+  if (!stub) return true;
   try {
     const res = await stub.fetch("https://do.internal/check-rpm", {
       method: "POST",
@@ -2562,9 +2520,7 @@ async function checkVirtualKeyRpm(env, token, rpmLimit) {
 }
 
 function reportKeyOutcome(env, ctx, payload) {
-  // Cập nhật ngay local mirror để request tiếp theo trong isolate thấy liền
   applyKeyOutcomeToState(localState, payload);
-
   const stub = getDOStub(env);
   if (stub && ctx) {
     ctx.waitUntil(
@@ -2579,7 +2535,6 @@ function reportKeyOutcome(env, ctx, payload) {
 
 function recordRequestLog(env, ctx, entry) {
   applyLogToState(localState, entry);
-
   const stub = getDOStub(env);
   if (stub && ctx) {
     ctx.waitUntil(
@@ -2672,7 +2627,7 @@ export class GatewayState {
       virtualKeys: {},
       logs: []
     };
-    this.rpmBuckets = new Map(); // token -> timestamps[]
+    this.rpmBuckets = new Map();
   }
 
   async ensureLoaded() {
@@ -2793,7 +2748,7 @@ export class GatewayState {
 }
 
 // ============================================================================
-// ADMIN ROUTES & BUILT-IN DASHBOARD (/admin)
+// ADMIN ROUTES, MODELS EXPLORER API & BUILT-IN DASHBOARD (/admin)
 // ============================================================================
 async function handleAdminRoute(request, env, url, rawPath) {
   if (rawPath === "/admin" && request.method === "GET") {
@@ -2803,7 +2758,6 @@ async function handleAdminRoute(request, env, url, rawPath) {
     });
   }
 
-  // Bảo vệ toàn bộ /admin/api/* bằng ADMIN_KEY (hoặc WORKER_AUTH_KEY đầu tiên)
   const adminSecret = getAdminSecret(env);
   const provided = extractClientApiKey(request) || url.searchParams.get("key") || "";
   if (adminSecret && provided !== adminSecret) {
@@ -2849,6 +2803,12 @@ async function handleAdminRoute(request, env, url, rawPath) {
       virtualKeys: localState.virtualKeys,
       logs: localState.logs
     });
+  }
+
+  if (rawPath === "/admin/api/models" && request.method === "GET") {
+    const forceRefresh = url.searchParams.get("refresh") === "1";
+    const result = await fetchAdminModelsDetail(request, env, forceRefresh);
+    return jsonResponse(result, result.error ? 500 : 200);
   }
 
   if (rawPath === "/admin/api/reset-key" && request.method === "POST") {
@@ -2918,13 +2878,156 @@ async function handleAdminRoute(request, env, url, rawPath) {
   return jsonResponse({ error: "Not Found" }, 404);
 }
 
+async function fetchAdminModelsDetail(request, env, forceRefresh = false) {
+  const cfg = parseUpstreamConfig(env.UPSTREAM_CONFIG);
+  if (cfg.error) return { error: cfg.error, upstreams: [], models: [] };
+
+  const upstreamConfig = cfg.data;
+  const modelAliases = parseModelAliases(env.MODEL_ALIASES);
+  const totalUpstreams = upstreamConfig.length;
+
+  const perUpstreamResults = await Promise.all(upstreamConfig.map(async (upstream) => {
+    const startedAt = Date.now();
+    const rawKeys = Array.isArray(upstream.keys) ? upstream.keys.filter(Boolean) : [];
+    const baseUrlClean = String(upstream.baseUrl || "").replace(/\/+$/, "");
+    const targetModelsUrl = `${baseUrlClean}/models`;
+
+    if (rawKeys.length === 0) {
+      const staticList = fallbackStaticModels(upstream, totalUpstreams).map((m) => ({
+        rawId: String(m.id).replace(/\s*\(.*?\)/g, "").trim(),
+        displayId: m.id,
+        upstream: upstream.name,
+        ownedBy: upstream.name,
+        created: 0,
+        source: "static"
+      }));
+      return {
+        name: upstream.name,
+        baseUrl: baseUrlClean,
+        apiType: resolveApiType(upstream),
+        status: staticList.length ? "fallback" : "error",
+        httpStatus: 0,
+        latencyMs: 0,
+        count: staticList.length,
+        error: "Chưa cấu hình API key",
+        models: staticList
+      };
+    }
+
+    const orderedKeys = selectOrderedKeys(upstream.name, rawKeys, Math.floor(Math.random() * 1000)).slice(0, 3);
+    let lastHttpStatus = 0;
+    let lastError = "";
+
+    for (const keyEntry of orderedKeys) {
+      const headers = buildCleanHeaders(request.headers, keyEntry.apiKey, false, upstream);
+      try {
+        const res = await fetchWithTimeout(targetModelsUrl, { method: "GET", headers }, CONFIG.MODELS_TIMEOUT_MS);
+        lastHttpStatus = res.status;
+        if (res.ok) {
+          const rawData = await res.json();
+          const rawList = Array.isArray(rawData)
+            ? rawData
+            : (rawData && Array.isArray(rawData.data) ? rawData.data : (Array.isArray(rawData?.models) ? rawData.models : []));
+
+          const liveModels = rawList
+            .filter((m) => m && (m.id || m.name))
+            .map((m) => {
+              const rawId = String(m.id || m.name).replace(/\s*\(.*?\)/g, "").trim();
+              const displayId = totalUpstreams > 1 ? `${rawId} (${upstream.name})` : rawId;
+              return {
+                rawId,
+                displayId,
+                upstream: upstream.name,
+                ownedBy: m.owned_by || upstream.name,
+                created: m.created || 0,
+                source: "live"
+              };
+            })
+            .sort((a, b) => a.rawId.localeCompare(b.rawId));
+
+          return {
+            name: upstream.name,
+            baseUrl: baseUrlClean,
+            apiType: resolveApiType(upstream),
+            status: "live",
+            httpStatus: res.status,
+            latencyMs: Date.now() - startedAt,
+            count: liveModels.length,
+            error: "",
+            models: liveModels
+          };
+        }
+        const snippet = await res.text().then((t) => t.slice(0, 140)).catch(() => "");
+        lastError = `HTTP ${res.status}${snippet ? `: ${snippet}` : ""}`;
+      } catch (err) {
+        lastError = err?.message || "Fetch timeout / network error";
+      }
+    }
+
+    const staticList = fallbackStaticModels(upstream, totalUpstreams).map((m) => ({
+      rawId: String(m.id).replace(/\s*\(.*?\)/g, "").trim(),
+      displayId: m.id,
+      upstream: upstream.name,
+      ownedBy: upstream.name,
+      created: 0,
+      source: "static"
+    }));
+
+    return {
+      name: upstream.name,
+      baseUrl: baseUrlClean,
+      apiType: resolveApiType(upstream),
+      status: staticList.length ? "fallback" : "error",
+      httpStatus: lastHttpStatus,
+      latencyMs: Date.now() - startedAt,
+      count: staticList.length,
+      error: lastError || "Không lấy được danh sách model",
+      models: staticList
+    };
+  }));
+
+  const aliasEntries = Object.entries(modelAliases).map(([alias, target]) => ({
+    rawId: alias,
+    displayId: alias,
+    upstream: "alias",
+    ownedBy: `alias -> ${target}`,
+    created: 0,
+    source: "alias"
+  }));
+
+  const allModels = [...aliasEntries];
+  for (const u of perUpstreamResults) {
+    allModels.push(...u.models);
+  }
+
+  if (forceRefresh && allModels.length > 0) {
+    const cacheItems = Array.from(
+      new Map(allModels.map((m) => [m.displayId, { id: m.displayId, object: "model", owned_by: m.ownedBy }])).values()
+    );
+    const cachePayload = { object: "list", data: cacheItems };
+    modelsCache = { expiresAt: Date.now() + CONFIG.MODELS_CACHE_TTL_MS, payload: cachePayload };
+    if (env.GATEWAY_KV) {
+      await env.GATEWAY_KV.put("models_cache_v3", JSON.stringify(cachePayload), {
+        expirationTtl: Math.max(60, Math.floor(CONFIG.MODELS_CACHE_TTL_MS / 1000))
+      }).catch(() => {});
+    }
+  }
+
+  return {
+    fetchedAt: Date.now(),
+    totalModels: allModels.length,
+    upstreams: perUpstreamResults.map(({ models, ...meta }) => meta),
+    models: allModels
+  };
+}
+
 function renderAdminHTML() {
   return `<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI Gateway v3.0 — Admin Dashboard</title>
+<title>AI Gateway v3.1 — Admin Dashboard</title>
 <style>
   :root { --bg:#0b0f17; --card:#121826; --border:#1f2937; --text:#e5e7eb; --muted:#9ca3af; --accent:#3b82f6; --green:#10b981; --yellow:#f59e0b; --red:#ef4444; }
   * { box-sizing:border-box; }
@@ -2935,9 +3038,15 @@ function renderAdminHTML() {
   .badge.ok { background:#064e3b; color:#6ee7b7; }
   .badge.warn { background:#78350f; color:#fcd34d; }
   .badge.err { background:#7f1d1d; color:#fca5a5; }
-  main { max-width:1360px; margin:0 auto; padding:20px; display:grid; gap:20px; }
+  main { max-width:1360px; margin:0 auto; padding:20px; display:grid; gap:18px; }
+  .tabs { display:flex; gap:8px; border-bottom:1px solid var(--border); padding-bottom:10px; }
+  .tab-btn { background:transparent; border:1px solid transparent; color:var(--muted); padding:8px 16px; border-radius:8px; cursor:pointer; font-size:13px; font-weight:600; }
+  .tab-btn:hover { color:var(--text); background:#161e2e; }
+  .tab-btn.active { background:#1e293b; border-color:#334155; color:#fff; }
   .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:14px; }
+  .up-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; margin-bottom:16px; }
   .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; }
+  .up-card { background:#0f172a; border:1px solid var(--border); border-radius:8px; padding:12px; }
   .stat-label { color:var(--muted); font-size:12px; margin-bottom:6px; }
   .stat-val { font-size:24px; font-weight:700; }
   .stat-sub { color:var(--muted); font-size:12px; margin-top:4px; }
@@ -2947,29 +3056,32 @@ function renderAdminHTML() {
   button:hover { background:#374151; }
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
   button.danger { background:#7f1d1d; border-color:#991b1b; color:#fecaca; }
-  input { background:#0f172a; color:var(--text); border:1px solid #334155; padding:7px 10px; border-radius:6px; font-size:13px; }
+  input, select { background:#0f172a; color:var(--text); border:1px solid #334155; padding:7px 10px; border-radius:6px; font-size:13px; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th, td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--border); }
   th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; }
   .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
   .table-wrap { overflow-x:auto; }
   #loginBox { max-width:380px; margin:100px auto; text-align:center; }
-  .row-actions { display:flex; gap:6px; }
+  .row-actions { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  .stack { display:grid; gap:18px; }
   .hidden { display:none !important; }
+  #toast { position:fixed; bottom:20px; right:20px; background:#065f46; color:#ecfdf5; padding:9px 14px; border-radius:8px; font-size:13px; font-weight:600; box-shadow:0 8px 24px rgba(0,0,0,.4); opacity:0; transition:opacity .2s; pointer-events:none; }
+  #toast.show { opacity:1; }
 </style>
 </head>
 <body>
 <div id="loginBox" class="card">
-  <h2 style="margin-top:0">AI Gateway v3.0 Admin</h2>
+  <h2 style="margin-top:0">AI Gateway v3.1 Admin</h2>
   <p style="color:var(--muted);font-size:13px">Nhập <b>ADMIN_KEY</b> (hoặc WORKER_AUTH_KEY) để đăng nhập.</p>
-  <input id="adminKeyInput" type="password" placeholder="Admin Key..." style="width:100%;margin-bottom:12px">
+  <input id="adminKeyInput" type="password" placeholder="Admin Key..." style="width:100%;margin-bottom:12px" onkeydown="if(event.key==='Enter')doLogin()">
   <button class="primary" style="width:100%;padding:9px" onclick="doLogin()">Đăng nhập</button>
   <p id="loginErr" style="color:var(--red);font-size:12px"></p>
 </div>
 
 <div id="app" class="hidden">
   <header>
-    <h1>⚡ AI Gateway <span id="verBadge" class="badge">v3.0</span> <span id="storageBadge" class="badge">...</span></h1>
+    <h1>⚡ AI Gateway <span id="verBadge" class="badge">v3.1</span> <span id="storageBadge" class="badge">...</span></h1>
     <div class="row-actions">
       <button onclick="loadState()">↻ Làm mới</button>
       <button onclick="resetKey('ALL')">Mở khóa tất cả Key</button>
@@ -2979,61 +3091,126 @@ function renderAdminHTML() {
   </header>
 
   <main>
-    <div class="grid">
-      <div class="card"><div class="stat-label">Tổng Requests</div><div class="stat-val" id="stReq">0</div><div class="stat-sub" id="stRate">Success: 100%</div></div>
-      <div class="card"><div class="stat-label">Failovers đã cứu</div><div class="stat-val" id="stFailover">0</div><div class="stat-sub" id="stErr">Errors: 0</div></div>
-      <div class="card"><div class="stat-label">Input / Output Tokens</div><div class="stat-val" id="stTok">0</div><div class="stat-sub" id="stCache">Cached: 0</div></div>
-      <div class="card"><div class="stat-label">API Keys</div><div class="stat-val" id="stKeys">0/0</div><div class="stat-sub" id="stKv">KV Cache: Off</div></div>
+    <div class="tabs">
+      <button id="tabBtn-overview" class="tab-btn active" onclick="switchTab('overview')">📊 Tổng quan & Keys</button>
+      <button id="tabBtn-models" class="tab-btn" onclick="switchTab('models')">🤖 Models API <span id="modelsCountBadge" class="badge" style="margin-left:4px">-</span></button>
     </div>
 
-    <div class="card">
-      <div class="section-head">
-        <h2>🔑 Sức khỏe Key & Circuit Breaker</h2>
-        <span style="color:var(--muted);font-size:12px">Tự làm mới mỗi 5 giây</span>
+    <div id="tab-overview" class="stack">
+      <div class="grid">
+        <div class="card"><div class="stat-label">Tổng Requests</div><div class="stat-val" id="stReq">0</div><div class="stat-sub" id="stRate">Success: 100%</div></div>
+        <div class="card"><div class="stat-label">Failovers đã cứu</div><div class="stat-val" id="stFailover">0</div><div class="stat-sub" id="stErr">Errors: 0</div></div>
+        <div class="card"><div class="stat-label">Input / Output Tokens</div><div class="stat-val" id="stTok">0</div><div class="stat-sub" id="stCache">Cached: 0</div></div>
+        <div class="card"><div class="stat-label">API Keys</div><div class="stat-val" id="stKeys">0/0</div><div class="stat-sub" id="stKv">KV Cache: Off</div></div>
       </div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Upstream</th><th>Key</th><th>Trạng thái</th><th>EWMA TTFB</th><th>OK / Lỗi</th><th>Lỗi gần nhất</th><th>Thao tác</th></tr></thead>
-          <tbody id="keysTbody"></tbody>
-        </table>
-      </div>
-    </div>
 
-    <div class="card">
-      <div class="section-head">
-        <h2>🎟️ Virtual Keys & Giới hạn RPM</h2>
-        <div class="row-actions">
-          <input id="vkName" placeholder="Tên máy / App (vd: OpenCode)">
-          <input id="vkRpm" type="number" min="0" value="30" style="width:90px" title="0 = không giới hạn">
-          <button class="primary" onclick="createVK()">+ Tạo Key</button>
+      <div class="card">
+        <div class="section-head">
+          <h2>🔑 Sức khỏe Key & Circuit Breaker</h2>
+          <span style="color:var(--muted);font-size:12px">Tự làm mới mỗi 5 giây</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Upstream</th><th>Key</th><th>Trạng thái</th><th>EWMA TTFB</th><th>OK / Lỗi</th><th>Lỗi gần nhất</th><th>Thao tác</th></tr></thead>
+            <tbody id="keysTbody"></tbody>
+          </table>
         </div>
       </div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Tên</th><th>Virtual Token</th><th>RPM Limit</th><th>Trạng thái</th><th>Thao tác</th></tr></thead>
-          <tbody id="vkTbody"></tbody>
-        </table>
+
+      <div class="card">
+        <div class="section-head">
+          <h2>🎟️ Virtual Keys & Giới hạn RPM</h2>
+          <div class="row-actions">
+            <input id="vkName" placeholder="Tên máy / App (vd: Claude Code)">
+            <input id="vkRpm" type="number" min="0" value="30" style="width:90px" title="0 = không giới hạn">
+            <button class="primary" onclick="createVK()">+ Tạo Key</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Tên</th><th>Virtual Token</th><th>RPM Limit</th><th>Trạng thái</th><th>Thao tác</th></tr></thead>
+            <tbody id="vkTbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="section-head"><h2>📜 Request Logs gần nhất (100 dòng)</h2></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Thời gian</th><th>Client</th><th>Model</th><th>Upstream</th><th>Key</th><th>Status</th><th>TTFB</th><th>Tokens (In/Out/Cache)</th><th>Mode / Lỗi</th></tr></thead>
+            <tbody id="logsTbody"></tbody>
+          </table>
+        </div>
       </div>
     </div>
 
-    <div class="card">
-      <div class="section-head"><h2>📜 Request Logs gần nhất (100 dòng)</h2></div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Thời gian</th><th>Client</th><th>Model</th><th>Upstream</th><th>Key</th><th>Status</th><th>TTFB</th><th>Tokens (In/Out/Cache)</th><th>Mode / Lỗi</th></tr></thead>
-          <tbody id="logsTbody"></tbody>
-        </table>
+    <div id="tab-models" class="stack hidden">
+      <div class="card">
+        <div class="section-head">
+          <div>
+            <h2>🤖 Danh sách Models từ Upstream APIs</h2>
+            <div id="modelsMeta" style="color:var(--muted);font-size:12px;margin-top:4px">Nhấn Fetch để quét trực tiếp endpoint /models của tất cả upstream</div>
+          </div>
+          <div class="row-actions">
+            <select id="modelUpstreamFilter" onchange="renderModelsTable()">
+              <option value="ALL">Tất cả Upstream</option>
+            </select>
+            <input id="modelSearchInput" placeholder="Tìm model ID..." oninput="renderModelsTable()" style="min-width:200px">
+            <button onclick="copyFilteredModelsJson()">📋 Copy mảng JSON</button>
+            <button id="btnFetchModels" class="primary" onclick="loadAdminModels(true)">⚡ Fetch Live Models</button>
+          </div>
+        </div>
+
+        <div id="upstreamModelsCards" class="up-grid"></div>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th style="width:48px">#</th><th>Model ID (gốc)</th><th>Display ID (gọi API)</th><th>Upstream</th><th>Nguồn</th><th>Thao tác</th></tr></thead>
+            <tbody id="modelsTbody"><tr><td colspan="6" style="color:var(--muted)">Chưa tải dữ liệu...</td></tr></tbody>
+          </table>
+        </div>
       </div>
     </div>
   </main>
 </div>
 
+<div id="toast">Đã copy!</div>
+
 <script>
 let ADMIN_KEY = sessionStorage.getItem("gw_admin_key") || "";
 let pollTimer = null;
+let cachedModelsData = null;
 
 function esc(s){ return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 function fmtNum(n){ return Number(n||0).toLocaleString("en-US"); }
+
+function showToast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(window.__toastT);
+  window.__toastT = setTimeout(() => el.classList.remove("show"), 1800);
+}
+
+function copyText(text, label) {
+  navigator.clipboard.writeText(text).then(() => showToast(label || ("Đã copy: " + text)));
+}
+
+function copyFromAttr(btn) {
+  const val = btn.dataset.copy || "";
+  copyText(val, "Đã copy: " + val);
+}
+
+function switchTab(name) {
+  document.getElementById("tab-overview").classList.toggle("hidden", name !== "overview");
+  document.getElementById("tab-models").classList.toggle("hidden", name !== "models");
+  document.getElementById("tabBtn-overview").classList.toggle("active", name === "overview");
+  document.getElementById("tabBtn-models").classList.toggle("active", name === "models");
+  if (name === "models" && !cachedModelsData) {
+    loadAdminModels(false);
+  }
+}
 
 async function apiFetch(path, opts = {}) {
   const headers = Object.assign({ "Authorization": "Bearer " + ADMIN_KEY, "Content-Type": "application/json" }, opts.headers || {});
@@ -3070,6 +3247,101 @@ async function loadState() {
   } catch { return false; }
 }
 
+async function loadAdminModels(forceRefresh) {
+  const btn = document.getElementById("btnFetchModels");
+  const tbody = document.getElementById("modelsTbody");
+  btn.disabled = true;
+  btn.textContent = "⏳ Đang fetch...";
+  tbody.innerHTML = '<tr><td colspan="6" style="color:var(--muted)">Đang gọi /models tới các upstream...</td></tr>';
+
+  try {
+    const res = await apiFetch("/admin/api/models" + (forceRefresh ? "?refresh=1" : ""));
+    if (!res.ok) {
+      tbody.innerHTML = '<tr><td colspan="6" style="color:var(--red)">Lỗi HTTP ' + res.status + ' khi fetch models</td></tr>';
+      return;
+    }
+    cachedModelsData = await res.json();
+    document.getElementById("modelsCountBadge").textContent = cachedModelsData.totalModels || 0;
+    document.getElementById("modelsMeta").textContent =
+      "Tổng " + (cachedModelsData.totalModels || 0) + " models — cập nhật lúc " + new Date(cachedModelsData.fetchedAt || Date.now()).toLocaleTimeString("vi-VN") + (forceRefresh ? " (đã làm mới cache /v1/models)" : "");
+
+    const sel = document.getElementById("modelUpstreamFilter");
+    const prevVal = sel.value;
+    const opts = ['<option value="ALL">Tất cả Upstream (' + (cachedModelsData.totalModels || 0) + ')</option>'];
+    for (const u of cachedModelsData.upstreams || []) {
+      opts.push('<option value="' + esc(u.name) + '">' + esc(u.name) + ' (' + u.count + ')</option>');
+    }
+    if ((cachedModelsData.models || []).some((m) => m.source === "alias")) {
+      opts.push('<option value="alias">Aliases</option>');
+    }
+    sel.innerHTML = opts.join("");
+    if (Array.from(sel.options).some((o) => o.value === prevVal)) sel.value = prevVal;
+
+    const cards = (cachedModelsData.upstreams || []).map((u) => {
+      const badge = u.status === "live"
+        ? '<span class="badge ok">LIVE (' + u.httpStatus + ')</span>'
+        : u.status === "fallback"
+          ? '<span class="badge warn">STATIC FALLBACK</span>'
+          : '<span class="badge err">ERROR</span>';
+      return '<div class="up-card">'
+        + '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px"><b>' + esc(u.name) + '</b>' + badge + '</div>'
+        + '<div class="mono" style="color:var(--muted);word-break:break-all">' + esc(u.baseUrl) + '/models</div>'
+        + '<div style="margin-top:8px;font-size:12px">Models: <b>' + u.count + '</b> | API: <b>' + esc(u.apiType) + '</b> | Latency: <b>' + (u.latencyMs || 0) + 'ms</b></div>'
+        + (u.error ? '<div style="margin-top:6px;color:#fca5a5;font-size:12px">' + esc(u.error) + '</div>' : '')
+        + '</div>';
+    });
+    document.getElementById("upstreamModelsCards").innerHTML = cards.join("");
+    renderModelsTable();
+  } catch (e) {
+    tbody.innerHTML = '<tr><td colspan="6" style="color:var(--red)">Lỗi kết nối: ' + esc(e.message || e) + '</td></tr>';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "⚡ Fetch Live Models";
+  }
+}
+
+function getFilteredModels() {
+  if (!cachedModelsData) return [];
+  const up = document.getElementById("modelUpstreamFilter").value;
+  const q = document.getElementById("modelSearchInput").value.trim().toLowerCase();
+  return (cachedModelsData.models || []).filter((m) => {
+    if (up !== "ALL" && m.upstream !== up) return false;
+    if (q && !m.rawId.toLowerCase().includes(q) && !m.displayId.toLowerCase().includes(q) && !m.upstream.toLowerCase().includes(q)) return false;
+    return true;
+  });
+}
+
+function renderModelsTable() {
+  const list = getFilteredModels();
+  const tbody = document.getElementById("modelsTbody");
+  if (!list.length) {
+    tbody.innerHTML = '<tr><td colspan="6" style="color:var(--muted)">Không có model nào khớp bộ lọc.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = list.map((m, idx) => {
+    const srcBadge = m.source === "live"
+      ? '<span class="badge ok">LIVE</span>'
+      : m.source === "alias"
+        ? '<span class="badge">ALIAS</span>'
+        : '<span class="badge warn">STATIC</span>';
+    return '<tr><td class="mono" style="color:var(--muted)">' + (idx + 1) + '</td>'
+      + '<td class="mono"><b>' + esc(m.rawId) + '</b></td>'
+      + '<td class="mono">' + esc(m.displayId) + '</td>'
+      + '<td>' + esc(m.upstream) + '</td>'
+      + '<td>' + srcBadge + '</td>'
+      + '<td class="row-actions">'
+      + '<button data-copy="' + esc(m.rawId) + '" onclick="copyFromAttr(this)">Copy ID</button>'
+      + (m.displayId !== m.rawId ? '<button data-copy="' + esc(m.displayId) + '" onclick="copyFromAttr(this)">Copy Display ID</button>' : '')
+      + '</td></tr>';
+  }).join("");
+}
+
+function copyFilteredModelsJson() {
+  const ids = Array.from(new Set(getFilteredModels().filter((m) => m.source !== "alias").map((m) => m.rawId)));
+  if (!ids.length) { showToast("Không có model để copy"); return; }
+  copyText(JSON.stringify(ids), "Đã copy mảng JSON (" + ids.length + " models)");
+}
+
 function renderState(d) {
   document.getElementById("verBadge").textContent = "v" + d.version;
   document.getElementById("storageBadge").textContent = d.storageMode;
@@ -3098,7 +3370,7 @@ function renderState(d) {
         + '<td class="mono">' + (k.ewmaTtfbMs ? k.ewmaTtfbMs + 'ms' : '-') + '</td>'
         + '<td class="mono">' + k.okCount + ' / ' + k.errCount + '</td>'
         + '<td style="color:var(--muted);max-width:260px;overflow:hidden;text-overflow:ellipsis">' + esc(k.lastError || '-') + '</td>'
-        + '<td><button onclick="resetKey(\\'' + esc(k.keyId) + '\\')">Unblock</button></td></tr>');
+        + '<td><button data-keyid="' + esc(k.keyId) + '" onclick="resetKey(this.dataset.keyid)">Unblock</button></td></tr>');
     }
   }
   document.getElementById("stKeys").textContent = healthyKeys + " / " + totalKeys + " sống";
@@ -3107,11 +3379,11 @@ function renderState(d) {
   const vkRows = [];
   for (const [token, vk] of Object.entries(d.virtualKeys || {})) {
     vkRows.push('<tr><td><b>' + esc(vk.name) + '</b></td>'
-      + '<td class="mono">' + esc(token) + ' <button onclick="navigator.clipboard.writeText(\\'' + esc(token) + '\\')">Copy</button></td>'
+      + '<td class="mono">' + esc(token) + ' <button data-copy="' + esc(token) + '" onclick="copyFromAttr(this)">Copy</button></td>'
       + '<td class="mono">' + (vk.rpm > 0 ? vk.rpm + ' / phút' : 'Không giới hạn') + '</td>'
       + '<td>' + (vk.enabled ? '<span class="badge ok">ACTIVE</span>' : '<span class="badge err">DISABLED</span>') + '</td>'
-      + '<td class="row-actions"><button onclick="vkAction(\\'toggle\\',\\'' + esc(token) + '\\')">Bật/Tắt</button>'
-      + '<button class="danger" onclick="vkAction(\\'delete\\',\\'' + esc(token) + '\\')">Xóa</button></td></tr>');
+      + '<td class="row-actions"><button data-act="toggle" data-tok="' + esc(token) + '" onclick="vkAction(this.dataset.act,this.dataset.tok)">Bật/Tắt</button>'
+      + '<button class="danger" data-act="delete" data-tok="' + esc(token) + '" onclick="vkAction(this.dataset.act,this.dataset.tok)">Xóa</button></td></tr>');
   }
   document.getElementById("vkTbody").innerHTML = vkRows.join("") || '<tr><td colspan="5" style="color:var(--muted)">Chưa tạo Virtual Key nào</td></tr>';
 
@@ -3151,7 +3423,6 @@ async function clearStats() {
   loadState();
 }
 
-// Tự đăng nhập nếu đã có key trong sessionStorage hoặc server không đặt Admin Key
 (async () => {
   const ok = await loadState();
   if (ok) {
@@ -3276,7 +3547,6 @@ function buildCleanHeaders(incomingHeaders, apiKey, hasBody = true, upstream = n
     }
   }
 
-  // Hỗ trợ cả upstream chuẩn OpenAI (Bearer) và upstream chuẩn Anthropic native (x-api-key)
   if (resolveApiType(upstream) === "anthropic") {
     headers.set("x-api-key", apiKey);
     if (!headers.has("anthropic-version")) headers.set("anthropic-version", "2023-06-01");
@@ -3284,7 +3554,6 @@ function buildCleanHeaders(incomingHeaders, apiKey, hasBody = true, upstream = n
     headers.set("Authorization", `Bearer ${apiKey}`);
   }
 
-  // Custom headers theo từng upstream (nếu có)
   if (upstream?.headers && typeof upstream.headers === "object") {
     for (const [k, v] of Object.entries(upstream.headers)) {
       headers.set(k, String(v));

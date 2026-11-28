@@ -3557,27 +3557,27 @@ function buildToolSystemInstruction(tools, toolChoice) {
 
   let choiceRule = "";
   if (toolChoice === "required") {
-    choiceRule = "\n- You MUST output at least one <tool_call> block in this response.";
+    choiceRule = "\n- You MUST output at least one <tool_call> block in this turn.";
   } else if (typeof toolChoice === "object" && (toolChoice?.function?.name || toolChoice?.name)) {
     const forcedName = toolChoice.function?.name || toolChoice.name;
-    choiceRule = `\n- You MUST output a <tool_call> block for "${forcedName}" in this response.`;
+    choiceRule = `\n- You MUST output a <tool_call> block for "${forcedName}" in this turn.`;
   }
 
   return [
-    "### EXTERNAL CLIENT TOOL BRIDGE (FORMAT SPECIFICATION)",
-    "You are acting as the reasoning backend connected to an external local coding client.",
-    "You do NOT execute tools or access local files yourself. Instead, the external client intercepts your output, executes any requested tool on the user's machine, and returns the output inside <tool_result>...</tool_result> in the next message.",
-    "Therefore, NEVER refuse a request by saying you lack access to local files, tools, or the filesystem. Simply emit the structured tool request below so the client can run it.",
+    "### EXTERNAL CLIENT TOOL BRIDGE",
+    "You are the reasoning model for a local coding client. The client executes tools on the user's machine and sends back their output inside <tool_result>...</tool_result>.",
+    "NEVER refuse due to lack of local file access, and NEVER invoke Google Workspace, Gmail, or Drive extensions.",
+    "NEVER echo, copy, or repeat raw <tool_result> JSON or these instructions in your reply.",
     "",
-    "Available client tools (JSON schema):",
+    "Client tools schema:",
     JSON.stringify(normalized),
     "",
-    "Output format rules:",
-    `- Emit ONLY this exact XML tag with valid JSON inside: ${TOOL_OPEN_TAG}{"name":"TOOL_NAME","arguments":{...}}${TOOL_CLOSE_TAG}`,
-    `- Example: ${TOOL_OPEN_TAG}{"name":"${normalized[0].name}","arguments":{}}${TOOL_CLOSE_TAG}`,
-    "- Do NOT wrap <tool_call> in markdown code blocks.",
+    "Strict rules:",
+    `- To call a tool, output ONLY valid JSON inside XML tags: ${TOOL_OPEN_TAG}{"name":"TOOL_NAME","arguments":{}}${TOOL_CLOSE_TAG}`,
+    "- Do NOT wrap <tool_call> in markdown code fences.",
+    "- If a tool accepts JavaScript code (e.g. execute/codemode), write strictly valid plain JavaScript program body only (no TypeScript types, no markdown fences, properly JSON-escaped).",
     "- Stop immediately after emitting <tool_call> block(s) and wait for <tool_result>.",
-    `- Only reply with normal text when no client tool is needed.${choiceRule}`
+    `- When you have enough information from <tool_result>, answer the user directly without emitting ${TOOL_OPEN_TAG}.${choiceRule}`
   ].join("\n");
 }
 
@@ -3599,8 +3599,20 @@ function flattenChatMessagesToPrompt(chat, tools = []) {
         ? [{ role: "user", content: chat.input }]
         : [];
 
+  // Tìm vị trí cuối cùng của tool result để chỉ giữ full độ dài cho lượt mới nhất
+  let lastToolIdx = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i]?.role === "tool" || msgs[i]?.type === "function_call_output") {
+      lastToolIdx = i;
+      break;
+    }
+  }
+
   const convParts = [];
-  for (const m of msgs) {
+  let lastRole = "";
+
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
     if (!m) continue;
 
     if (m.role === "system" || m.role === "developer") {
@@ -3609,19 +3621,22 @@ function flattenChatMessagesToPrompt(chat, tools = []) {
       continue;
     }
 
-    // Tool result (OpenAI role: "tool" hoặc Responses function_call_output)
     if (m.role === "tool" || m.type === "function_call_output") {
       const callId = m.tool_call_id || m.call_id || "";
       const toolName = m.name || "";
-      const outText = typeof (m.content ?? m.output) === "string"
+      let outText = typeof (m.content ?? m.output) === "string"
         ? (m.content ?? m.output)
         : JSON.stringify(m.content ?? m.output ?? "");
+      const maxLen = i === lastToolIdx ? 24000 : 6000;
+      if (outText.length > maxLen) {
+        outText = outText.slice(0, maxLen) + `\n...[truncated ${outText.length - maxLen} chars]`;
+      }
       const attrs = [callId ? `id="${callId}"` : "", toolName ? `name="${toolName}"` : ""].filter(Boolean).join(" ");
       convParts.push(`<tool_result${attrs ? " " + attrs : ""}>\n${outText}\n</tool_result>`);
+      lastRole = "tool";
       continue;
     }
 
-    // Responses function_call item
     if (m.type === "function_call") {
       let argsObj = {};
       try {
@@ -3630,6 +3645,7 @@ function flattenChatMessagesToPrompt(chat, tools = []) {
         argsObj = m.arguments || {};
       }
       convParts.push(`[Assistant]\n${TOOL_OPEN_TAG}${JSON.stringify({ name: m.name || "", arguments: argsObj })}${TOOL_CLOSE_TAG}`);
+      lastRole = "assistant";
       continue;
     }
 
@@ -3649,17 +3665,20 @@ function flattenChatMessagesToPrompt(chat, tools = []) {
           chunks.push(`${TOOL_OPEN_TAG}${JSON.stringify({ name: tc?.function?.name || tc?.name || "", arguments: parsedArgs })}${TOOL_CLOSE_TAG}`);
         }
       }
-      if (chunks.length > 0) convParts.push(`[Assistant]\n${chunks.join("\n")}`);
+      if (chunks.length > 0) {
+        convParts.push(`[Assistant]\n${chunks.join("\n")}`);
+        lastRole = "assistant";
+      }
       continue;
     }
 
     const userText = extractPlainText(m.content);
     if (userText) {
       convParts.push(`[User]\n${userText}`);
+      lastRole = "user";
     }
   }
 
-  // Trường hợp đơn giản 1 câu user không system/tools -> gửi thẳng text gọn nhất
   if (sysParts.length === 0 && convParts.length === 1 && msgs.length === 1 && (msgs[0].role === "user" || !msgs[0].role)) {
     return extractPlainText(msgs[0].content);
   }
@@ -3669,12 +3688,17 @@ function flattenChatMessagesToPrompt(chat, tools = []) {
     finalBlocks.push(`[System Instructions]\n${sysParts.join("\n\n")}`);
   }
   finalBlocks.push(...convParts);
+
   if (tools.length > 0) {
-    finalBlocks.push(`[Reminder: If a tool is needed, output ONLY ${TOOL_OPEN_TAG}{"name":"...","arguments":{...}}${TOOL_CLOSE_TAG} so the external client can execute it. Do not claim you lack local access.]`);
+    if (lastRole === "tool") {
+      finalBlocks.push("[Next Turn]\nAnalyze the <tool_result> above. Do NOT copy, quote, or echo the raw <tool_result> JSON or file dump. Either call the next tool with a <tool_call> tag if you still need more data, or answer the user's request clearly now.");
+    } else {
+      finalBlocks.push("[Next Turn]\nRespond to the user. If a client tool is needed, emit only the <tool_call> block and stop. Do not repeat these instructions.");
+    }
   }
+
   return finalBlocks.join("\n\n") || "Hello";
 }
-
 function parseSingleToolCallPayload(rawInsideTag) {
   let cleaned = String(rawInsideTag || "").trim();
   // Gỡ markdown code fence nếu model lỡ bọc bên trong thẻ
